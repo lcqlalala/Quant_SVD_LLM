@@ -15,7 +15,6 @@ from utils.model_utils import *
 from evaluater import * 
 
 current_path = os.path.dirname(os.path.abspath(__file__))
-parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 

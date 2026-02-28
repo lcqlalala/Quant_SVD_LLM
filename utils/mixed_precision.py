@@ -89,22 +89,16 @@ def _pair_to_profile_name(pair: PairModules) -> Optional[str]:
         leaf = f"{pair.stem}_proj"
     elif pair.stem == "out":
         leaf = "out_proj"
-    elif pair.stem in {"gate", "down", "up", "fc1", "fc2"}:
-        leaf = f"{pair.stem}_proj" if pair.stem in {"gate", "down", "up"} else pair.stem
+    elif pair.stem in {"gate", "down", "up"}:
+        leaf = f"{pair.stem}_proj"
+    elif pair.stem in {"fc1", "fc2"}:
+        leaf = pair.stem
     else:
         return None
 
-    if pair.parent_path.endswith(".self_attn"):
+    if pair.parent_path.endswith(".self_attn") or ".self_attn." in pair.parent_path:
         return f"self_attn.{leaf}"
-    if pair.parent_path.endswith(".mlp"):
-        return f"mlp.{leaf}"
-    if pair.parent_path.endswith(".decoder") and leaf in {"fc1", "fc2"}:
-        return leaf
-    if pair.parent_path.endswith(".layers") and leaf in {"fc1", "fc2"}:
-        return leaf
-    if ".self_attn." in pair.parent_path:
-        return f"self_attn.{leaf}"
-    if ".mlp." in pair.parent_path:
+    if pair.parent_path.endswith(".mlp") or ".mlp." in pair.parent_path:
         return f"mlp.{leaf}"
     if leaf in {"fc1", "fc2"}:
         return leaf
