@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -241,6 +242,104 @@ def collect_kfac_stats_block_b(
     return stats
 
 
+def collect_kfac_stats_sigma_full(
+    model: nn.Module,
+    pairs: List[PairModules],
+    dataloader,
+    device: str = "cuda",
+    nsamples: int = 8,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """
+    Collect K-FAC moments projected to rank-space bases:
+      G_sigma = U^T G U, A_sigma = V A V^T.
+    These are sufficient to build full sigma-space Fisher:
+      F_sigma = G_sigma * A_sigma (Hadamard product).
+    """
+    stats: Dict[str, Dict[str, torch.Tensor]] = {}
+    handles = []
+    use_cache = getattr(model.config, "use_cache", False)
+    model.config.use_cache = False
+    model.eval()
+
+    for pair in pairs:
+        rank = pair.u_module.weight.shape[1]
+        stats[pair.key] = {
+            "A_proj": torch.zeros((rank, rank), dtype=torch.float64),
+            "G_proj": torch.zeros((rank, rank), dtype=torch.float64),
+            "count_a": torch.tensor(0.0, dtype=torch.float64),
+            "count_g": torch.tensor(0.0, dtype=torch.float64),
+        }
+
+        def mk_fwd_pre(k):
+            def _hook(module, inputs):
+                x = inputs[0].detach().float()
+                x_flat = x.reshape(-1, x.shape[-1])
+                # module is *_v_proj with shape [rank, in_dim]
+                V = module.weight.detach().float()
+                z = x_flat.matmul(V.transpose(0, 1))
+                stats[k]["A_proj"] += z.transpose(0, 1).matmul(z).to(dtype=torch.float64).cpu()
+                stats[k]["count_a"] += z.new_tensor(float(z.shape[0]), dtype=torch.float64).cpu()
+
+            return _hook
+
+        def mk_bwd(k):
+            def _hook(module, grad_input, grad_output):
+                g = grad_output[0].detach().float()
+                g_flat = g.reshape(-1, g.shape[-1])
+                # module is *_u_proj with shape [out_dim, rank]
+                U = module.weight.detach().float()
+                s = g_flat.matmul(U)
+                stats[k]["G_proj"] += s.transpose(0, 1).matmul(s).to(dtype=torch.float64).cpu()
+                stats[k]["count_g"] += s.new_tensor(float(s.shape[0]), dtype=torch.float64).cpu()
+
+            return _hook
+
+        handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
+        handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
+
+    for idx, batch in enumerate(dataloader):
+        if idx >= nsamples:
+            break
+        input_ids, labels = batch[0].to(device), batch[1].to(device)
+        model.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, labels=labels, use_cache=False)
+        out.loss.backward()
+
+    for h in handles:
+        h.remove()
+
+    for key, v in stats.items():
+        ca = max(v["count_a"].item(), 1.0)
+        cg = max(v["count_g"].item(), 1.0)
+        v["A_proj"] = (v["A_proj"] / ca).float().cpu()
+        v["G_proj"] = (v["G_proj"] / cg).float().cpu()
+        del v["count_a"]
+        del v["count_g"]
+
+    model.zero_grad(set_to_none=True)
+    model.config.use_cache = use_cache
+    return stats
+
+
+def compute_sigma_fisher_full(
+    pairs: List[PairModules],
+    stats: Dict[str, Dict[str, torch.Tensor]],
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for pair in pairs:
+        if pair.key not in stats:
+            continue
+        A_proj = stats[pair.key]["A_proj"].float().cpu()
+        G_proj = stats[pair.key]["G_proj"].float().cpu()
+        F_sigma = G_proj * A_proj
+        F_sigma = 0.5 * (F_sigma + F_sigma.transpose(0, 1))
+        if eps > 0:
+            F_sigma = F_sigma + eps * torch.eye(F_sigma.shape[0], dtype=F_sigma.dtype)
+        out[pair.key] = F_sigma
+    return out
+
+
 def compute_component_importance(
     pairs: List[PairModules], stats: Dict[str, Dict[str, torch.Tensor]]
 ) -> Dict[str, torch.Tensor]:
@@ -371,6 +470,128 @@ def solve_budgeted_topk(
             if (pair.key, i) in selected:
                 mask[i] = True
         alloc[pair.key] = mask
+    return alloc
+
+
+def _estimate_sigma_proxy(pair: PairModules) -> torch.Tensor:
+    """
+    Rank-component magnitude proxy in low-rank chain W = U V.
+    For component i, ||u_i v_i^T||_F = ||u_i|| * ||v_i||.
+    """
+    U = pair.u_module.weight.data.float()
+    V = pair.v_module.weight.data.float()
+    u_norm = torch.linalg.vector_norm(U, dim=0)
+    v_norm = torch.linalg.vector_norm(V, dim=1)
+    return (u_norm * v_norm).clamp_min(1e-12).cpu()
+
+
+def solve_budgeted_topk_quadratic(
+    pairs: List[PairModules],
+    fisher_sigma: Dict[str, torch.Tensor],
+    low_bit: int = 4,
+    high_bit: int = 8,
+    avg_bit: float = 4.5,
+    sigma_calib: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Budgeted greedy selection with sigma-space quadratic objective:
+      L ~ 1/2 * z^T F_sigma z
+    where z is component perturbation scale.
+    Start from all-low-bit baseline, then upgrade components to high-bit.
+    """
+    if high_bit <= low_bit:
+        raise ValueError("high_bit must be larger than low_bit")
+
+    total_params = 0.0
+    states: Dict[str, Dict[str, object]] = {}
+    alloc: Dict[str, torch.Tensor] = {}
+    noise_low = math.sqrt(_quant_noise_proxy(low_bit))
+    noise_high = math.sqrt(_quant_noise_proxy(high_bit))
+
+    for pair in pairs:
+        out_dim, rank = pair.u_module.weight.shape
+        _, in_dim = pair.v_module.weight.shape
+        params_per_component = float(out_dim + in_dim)
+        total_params += params_per_component * float(rank)
+        alloc[pair.key] = torch.zeros(rank, dtype=torch.bool)
+
+        if pair.key not in fisher_sigma:
+            continue
+        F = fisher_sigma[pair.key].float().cpu()
+        if F.shape != (rank, rank):
+            continue
+
+        sigma_vec = _estimate_sigma_proxy(pair).float().cpu()
+        if sigma_calib is not None and pair.key in sigma_calib:
+            low_vec = sigma_calib[pair.key]["low"].float().clamp_min(0.0).sqrt().cpu()
+            high_vec = sigma_calib[pair.key]["high"].float().clamp_min(0.0).sqrt().cpu()
+        else:
+            low_vec = torch.full((rank,), noise_low, dtype=torch.float32)
+            high_vec = torch.full((rank,), noise_high, dtype=torch.float32)
+
+        z = sigma_vec * low_vec
+        delta = sigma_vec * (high_vec - low_vec)  # negative when high<low
+        F = 0.5 * (F + F.transpose(0, 1))
+        Fz = F.matmul(z)
+
+        states[pair.key] = {
+            "F": F,
+            "Fz": Fz,
+            "delta": delta,
+            "mask": torch.zeros(rank, dtype=torch.bool),
+            "diag": torch.diag(F),
+            "cost": params_per_component * float(high_bit - low_bit),
+        }
+
+    target_avg = min(max(avg_bit, float(low_bit)), float(high_bit))
+    extra_budget = total_params * (target_avg - float(low_bit))
+    used = 0.0
+
+    while True:
+        best_key = None
+        best_idx = -1
+        best_density = 0.0
+        best_gain = 0.0
+        best_cost = 0.0
+
+        for key, st in states.items():
+            cost = float(st["cost"])
+            if used + cost > extra_budget + 1e-9:
+                continue
+            mask = st["mask"]  # type: ignore[assignment]
+            Fz = st["Fz"]  # type: ignore[assignment]
+            delta = st["delta"]  # type: ignore[assignment]
+            diag = st["diag"]  # type: ignore[assignment]
+            remain = ~mask
+            if not torch.any(remain):
+                continue
+            cand_idx = torch.where(remain)[0]
+            # gain = L(old)-L(new) for one-coordinate update z_i += delta_i
+            cand_delta = delta[cand_idx]
+            cand_gain = -(cand_delta * Fz[cand_idx] + 0.5 * (cand_delta * cand_delta) * diag[cand_idx])
+            max_gain, pos = torch.max(cand_gain, dim=0)
+            gain = float(max_gain.item())
+            if gain <= 0.0:
+                continue
+            density = gain / max(cost, 1e-12)
+            if density > best_density:
+                best_density = density
+                best_key = key
+                best_idx = int(cand_idx[int(pos.item())].item())
+                best_gain = gain
+                best_cost = cost
+
+        if best_key is None or best_idx < 0 or best_gain <= 0.0:
+            break
+
+        st = states[best_key]
+        delta_i = float(st["delta"][best_idx].item())  # type: ignore[index]
+        st["mask"][best_idx] = True  # type: ignore[index]
+        st["Fz"] += st["F"][:, best_idx] * delta_i  # type: ignore[index]
+        used += best_cost
+
+    for key, st in states.items():
+        alloc[key] = st["mask"].clone()  # type: ignore[assignment]
     return alloc
 
 

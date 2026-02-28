@@ -12,10 +12,13 @@ from utils.mixed_precision import (
     calibrate_component_sigma,
     collect_kfac_stats_block_b,
     collect_kfac_stats_diagonal,
+    collect_kfac_stats_sigma_full,
     compute_component_importance_block_b,
     compute_component_importance,
+    compute_sigma_fisher_full,
     discover_low_rank_pairs,
     solve_budgeted_topk,
+    solve_budgeted_topk_quadratic,
 )
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -308,7 +311,7 @@ if __name__ == '__main__':
         help='Number of calibration mini-batches used to estimate diagonal KFAC factors.'
     )
     parser.add_argument(
-        '--mp-kfac-mode', type=str, default='block_b', choices=['block_b', 'diag'],
+        '--mp-kfac-mode', type=str, default='block_b', choices=['block_b', 'diag', 'sigma_full'],
         help='KFAC approximation used for component importance.'
     )
     parser.add_argument(
@@ -382,6 +385,14 @@ if __name__ == '__main__':
         if len(pairs) == 0:
             raise RuntimeError("No low-rank *_u_proj/*_v_proj pairs found. Please use an SVD-compressed model.")
         print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision. mode={args.mp_kfac_mode}")
+        sigma_calib = None
+        if args.mp_sigma_mode == "calibrated":
+            sigma_calib = calibrate_component_sigma(
+                pairs=pairs,
+                low_bit=args.mp_low_bit,
+                high_bit=args.mp_high_bit,
+            )
+
         if args.mp_kfac_mode == "block_b":
             stats = collect_kfac_stats_block_b(
                 model=model,
@@ -401,7 +412,15 @@ if __name__ == '__main__':
                 adaptive_alpha=None if args.mp_a_alpha < 0 else args.mp_a_alpha,
                 adaptive_tau=args.mp_a_adaptive_tau,
             )
-        else:
+            alloc = solve_budgeted_topk(
+                pairs=pairs,
+                importance=importance,
+                low_bit=args.mp_low_bit,
+                high_bit=args.mp_high_bit,
+                avg_bit=args.mp_avg_bit,
+                sigma_calib=sigma_calib,
+            )
+        elif args.mp_kfac_mode == "diag":
             stats = collect_kfac_stats_diagonal(
                 model=model,
                 pairs=pairs,
@@ -410,21 +429,31 @@ if __name__ == '__main__':
                 nsamples=args.mp_kfac_nsamples,
             )
             importance = compute_component_importance(pairs, stats)
-        sigma_calib = None
-        if args.mp_sigma_mode == "calibrated":
-            sigma_calib = calibrate_component_sigma(
+            alloc = solve_budgeted_topk(
                 pairs=pairs,
+                importance=importance,
                 low_bit=args.mp_low_bit,
                 high_bit=args.mp_high_bit,
+                avg_bit=args.mp_avg_bit,
+                sigma_calib=sigma_calib,
             )
-        alloc = solve_budgeted_topk(
-            pairs=pairs,
-            importance=importance,
-            low_bit=args.mp_low_bit,
-            high_bit=args.mp_high_bit,
-            avg_bit=args.mp_avg_bit,
-            sigma_calib=sigma_calib,
-        )
+        else:
+            stats = collect_kfac_stats_sigma_full(
+                model=model,
+                pairs=pairs,
+                dataloader=dataloader,
+                device=args.DEV,
+                nsamples=args.mp_kfac_nsamples,
+            )
+            fisher_sigma = compute_sigma_fisher_full(pairs, stats)
+            alloc = solve_budgeted_topk_quadratic(
+                pairs=pairs,
+                fisher_sigma=fisher_sigma,
+                low_bit=args.mp_low_bit,
+                high_bit=args.mp_high_bit,
+                avg_bit=args.mp_avg_bit,
+                sigma_calib=sigma_calib,
+            )
         report_mixed_precision_allocation(pairs, alloc)
         apply_two_path_quantization(
             model=model,
