@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +75,71 @@ def discover_low_rank_pairs(model: nn.Module) -> List[PairModules]:
             )
         )
     return pairs
+
+
+def _extract_layer_index(path: str) -> Optional[int]:
+    m = re.search(r"\.layers\.(\d+)\.", path)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
+def _pair_to_profile_name(pair: PairModules) -> Optional[str]:
+    if pair.stem in {"q", "k", "v", "o"}:
+        leaf = f"{pair.stem}_proj"
+    elif pair.stem == "out":
+        leaf = "out_proj"
+    elif pair.stem in {"gate", "down", "up", "fc1", "fc2"}:
+        leaf = f"{pair.stem}_proj" if pair.stem in {"gate", "down", "up"} else pair.stem
+    else:
+        return None
+
+    if pair.parent_path.endswith(".self_attn"):
+        return f"self_attn.{leaf}"
+    if pair.parent_path.endswith(".mlp"):
+        return f"mlp.{leaf}"
+    if pair.parent_path.endswith(".decoder") and leaf in {"fc1", "fc2"}:
+        return leaf
+    if pair.parent_path.endswith(".layers") and leaf in {"fc1", "fc2"}:
+        return leaf
+    if ".self_attn." in pair.parent_path:
+        return f"self_attn.{leaf}"
+    if ".mlp." in pair.parent_path:
+        return f"mlp.{leaf}"
+    if leaf in {"fc1", "fc2"}:
+        return leaf
+    return None
+
+
+def build_pair_whiten_inv(
+    pairs: List[PairModules],
+    profiling_mat: Dict[int, Dict[str, torch.Tensor]],
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """
+    Build pair-key -> whitening inverse map from profiling matrices.
+    whitening inverse is R^{-1}, where R is Cholesky factor collected during whitening.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    for pair in pairs:
+        layer_idx = _extract_layer_index(pair.parent_path)
+        if layer_idx is None or layer_idx not in profiling_mat:
+            continue
+        prof_name = _pair_to_profile_name(pair)
+        if prof_name is None:
+            continue
+        layer_prof = profiling_mat[layer_idx]
+        if prof_name not in layer_prof:
+            continue
+        R = layer_prof[prof_name].float().cpu()
+        if eps > 0:
+            R = R + eps * torch.eye(R.shape[0], dtype=R.dtype)
+        try:
+            Rinv = torch.linalg.inv(R)
+        except Exception:
+            Rinv = torch.linalg.pinv(R)
+        out[pair.key] = Rinv
+    return out
 
 
 def collect_kfac_stats_diagonal(
@@ -248,6 +314,7 @@ def collect_kfac_stats_sigma_full(
     dataloader,
     device: str = "cuda",
     nsamples: int = 8,
+    whiten_inv: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     """
     Collect K-FAC moments projected to rank-space bases:
@@ -274,6 +341,8 @@ def collect_kfac_stats_sigma_full(
             def _hook(module, inputs):
                 x = inputs[0].detach().float()
                 x_flat = x.reshape(-1, x.shape[-1])
+                if whiten_inv is not None and k in whiten_inv:
+                    x_flat = x_flat.matmul(whiten_inv[k].to(device=x_flat.device, dtype=x_flat.dtype))
                 # module is *_v_proj with shape [rank, in_dim]
                 V = module.weight.detach().float()
                 z = x_flat.matmul(V.transpose(0, 1))
@@ -512,7 +581,6 @@ def solve_budgeted_topk_quadratic(
         out_dim, rank = pair.u_module.weight.shape
         _, in_dim = pair.v_module.weight.shape
         params_per_component = float(out_dim + in_dim)
-        total_params += params_per_component * float(rank)
         alloc[pair.key] = torch.zeros(rank, dtype=torch.bool)
 
         if pair.key not in fisher_sigma:
@@ -529,6 +597,12 @@ def solve_budgeted_topk_quadratic(
             low_vec = torch.full((rank,), noise_low, dtype=torch.float32)
             high_vec = torch.full((rank,), noise_high, dtype=torch.float32)
 
+        active = sigma_vec > 1e-12
+        active_count = int(active.sum().item())
+        if active_count == 0:
+            continue
+        total_params += params_per_component * float(active_count)
+
         z = sigma_vec * low_vec
         delta = sigma_vec * (high_vec - low_vec)  # negative when high<low
         F = 0.5 * (F + F.transpose(0, 1))
@@ -539,6 +613,7 @@ def solve_budgeted_topk_quadratic(
             "Fz": Fz,
             "delta": delta,
             "mask": torch.zeros(rank, dtype=torch.bool),
+            "active": active,
             "diag": torch.diag(F),
             "cost": params_per_component * float(high_bit - low_bit),
         }
@@ -559,10 +634,11 @@ def solve_budgeted_topk_quadratic(
             if used + cost > extra_budget + 1e-9:
                 continue
             mask = st["mask"]  # type: ignore[assignment]
+            active = st["active"]  # type: ignore[assignment]
             Fz = st["Fz"]  # type: ignore[assignment]
             delta = st["delta"]  # type: ignore[assignment]
             diag = st["diag"]  # type: ignore[assignment]
-            remain = ~mask
+            remain = (~mask) & active
             if not torch.any(remain):
                 continue
             cand_idx = torch.where(remain)[0]

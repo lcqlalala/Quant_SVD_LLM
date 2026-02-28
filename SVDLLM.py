@@ -19,6 +19,32 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def _target_rank(rows: int, cols: int, ratio: float, no_truncation: bool = False) -> int:
+    if no_truncation:
+        return min(rows, cols)
+    rank = int(rows * cols * ratio / (rows + cols))
+    return max(rank, 1)
+
+
+def _construction_ratio(ratio: float, no_truncation: bool = False) -> float:
+    # no_truncation mode needs module bottlenecks large enough to host full-rank factors.
+    return 2.0 if no_truncation else ratio
+
+
+def _assign_factorized_weights(u_proj: nn.Linear, v_proj: nn.Linear, svd_u: torch.Tensor, svd_v: torch.Tensor):
+    with torch.no_grad():
+        uw = u_proj.weight.data
+        vw = v_proj.weight.data
+        uw.zero_()
+        vw.zero_()
+        r = min(uw.shape[1], vw.shape[0], svd_u.shape[1], svd_v.shape[0])
+        out_rows = min(uw.shape[0], svd_u.shape[0])
+        in_cols = min(vw.shape[1], svd_v.shape[1])
+        if r > 0 and out_rows > 0 and in_cols > 0:
+            uw[:out_rows, :r] = svd_u[:out_rows, :r].to(uw.dtype)
+            vw[:r, :in_cols] = svd_v[:r, :in_cols].to(vw.dtype)
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -184,25 +210,26 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev):
+def whitening(model_name, model, profiling_mat, ratio, dev, no_truncation=False):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
     else:
         layers = model.model.layers
     print("Start SVD decomposition after whitening...")
+    module_ratio = _construction_ratio(ratio, no_truncation=no_truncation)
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=module_ratio)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=module_ratio)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=module_ratio)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=module_ratio)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=module_ratio)
         #### Replace Attn, MLP ####
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
@@ -218,7 +245,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = _target_rank(W.shape[0], W.shape[1], ratio, no_truncation=no_truncation)
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
@@ -229,55 +256,42 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(dtype)
             if 'opt' in model_name:
                 if "q_proj" in name:
-                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.q_u_proj, svd_decoder.self_attn.q_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data  # the linear layer in OPT has bias, which is different from LLaMA and Mistral
                 elif "k_proj" in name:
-                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.k_u_proj, svd_decoder.self_attn.k_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
                 elif "v_proj" in name:
-                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.v_u_proj, svd_decoder.self_attn.v_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
                 elif "out_proj" in name:
-                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.out_u_proj, svd_decoder.self_attn.out_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
                 elif "fc1" in name:
-                    svd_decoder.fc1_u_proj.weight.data = svd_u
-                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.fc1_u_proj, svd_decoder.fc1_v_proj, svd_u, svd_v)
                     svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
                 elif "fc2" in name:
-                    svd_decoder.fc2_u_proj.weight.data = svd_u
-                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.fc2_u_proj, svd_decoder.fc2_v_proj, svd_u, svd_v)
                     svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
                     svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
                     svd_decoder.final_layer_norm = layer.final_layer_norm
                     layers[i] = svd_decoder
             else:
                 if "q_proj" in name:
-                    svd_attn.q_u_proj.weight.data = svd_u
-                    svd_attn.q_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.q_u_proj, svd_attn.q_v_proj, svd_u, svd_v)
                 elif "k_proj" in name:
-                    svd_attn.k_u_proj.weight.data = svd_u
-                    svd_attn.k_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.k_u_proj, svd_attn.k_v_proj, svd_u, svd_v)
                 elif "v_proj" in name:
-                    svd_attn.v_u_proj.weight.data = svd_u
-                    svd_attn.v_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.v_u_proj, svd_attn.v_v_proj, svd_u, svd_v)
                 elif "o_proj" in name:
-                    svd_attn.o_u_proj.weight.data = svd_u
-                    svd_attn.o_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.o_u_proj, svd_attn.o_v_proj, svd_u, svd_v)
                     layer.self_attn =  svd_attn
                 elif "gate_proj" in name:
-                    svd_mlp.gate_u_proj.weight.data = svd_u
-                    svd_mlp.gate_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.gate_u_proj, svd_mlp.gate_v_proj, svd_u, svd_v)
                 elif "down_proj" in name:
-                    svd_mlp.down_u_proj.weight.data = svd_u
-                    svd_mlp.down_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.down_u_proj, svd_mlp.down_v_proj, svd_u, svd_v)
                 elif "up_proj" in name:
-                    svd_mlp.up_u_proj.weight.data = svd_u
-                    svd_mlp.up_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.up_u_proj, svd_mlp.up_v_proj, svd_u, svd_v)
                     layer.mlp = svd_mlp
             W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT  = truc_s = truc_u = truc_v = sqrtSigma = None
             del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
@@ -286,7 +300,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, no_truncation=False):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -338,24 +352,25 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     attention_masks = cache['attention_mask']
     if "opt" not in model_name:
         position_ids = cache['position_ids']
+    module_ratio = _construction_ratio(ratio, no_truncation=no_truncation)
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
         gpts = {}
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=module_ratio)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=module_ratio)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=module_ratio)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=module_ratio)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=module_ratio)
         for name in subset:
             if profiling_mat is not None:
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
             else: 
                 scaling_diag_matrix = None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update)
+            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update, no_truncation=no_truncation)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -375,55 +390,42 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
             if 'opt' in model_name:
                 if "q_proj" in name:
-                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.q_u_proj, svd_decoder.self_attn.q_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data  # the linear layer in OPT has bias, which is different from LLaMA and Mistral
                 elif "k_proj" in name:
-                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.k_u_proj, svd_decoder.self_attn.k_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
                 elif "v_proj" in name:
-                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.v_u_proj, svd_decoder.self_attn.v_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
                 elif "out_proj" in name:
-                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.self_attn.out_u_proj, svd_decoder.self_attn.out_v_proj, svd_u, svd_v)
                     svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
                 elif "fc1" in name:
-                    svd_decoder.fc1_u_proj.weight.data = svd_u
-                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.fc1_u_proj, svd_decoder.fc1_v_proj, svd_u, svd_v)
                     svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
                 elif "fc2" in name:
-                    svd_decoder.fc2_u_proj.weight.data = svd_u
-                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_decoder.fc2_u_proj, svd_decoder.fc2_v_proj, svd_u, svd_v)
                     svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
                     svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
                     svd_decoder.final_layer_norm = layer.final_layer_norm
                     layers[i] = svd_decoder
             else:
                 if "q_proj" in name:
-                    svd_attn.q_u_proj.weight.data = svd_u
-                    svd_attn.q_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.q_u_proj, svd_attn.q_v_proj, svd_u, svd_v)
                 elif "k_proj" in name:
-                    svd_attn.k_u_proj.weight.data = svd_u
-                    svd_attn.k_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.k_u_proj, svd_attn.k_v_proj, svd_u, svd_v)
                 elif "v_proj" in name:
-                    svd_attn.v_u_proj.weight.data = svd_u
-                    svd_attn.v_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.v_u_proj, svd_attn.v_v_proj, svd_u, svd_v)
                 elif "o_proj" in name:
-                    svd_attn.o_u_proj.weight.data = svd_u
-                    svd_attn.o_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_attn.o_u_proj, svd_attn.o_v_proj, svd_u, svd_v)
                     layer.self_attn =  svd_attn
                 elif "gate_proj" in name:
-                    svd_mlp.gate_u_proj.weight.data = svd_u
-                    svd_mlp.gate_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.gate_u_proj, svd_mlp.gate_v_proj, svd_u, svd_v)
                 elif "down_proj" in name:
-                    svd_mlp.down_u_proj.weight.data = svd_u
-                    svd_mlp.down_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.down_u_proj, svd_mlp.down_v_proj, svd_u, svd_v)
                 elif "up_proj" in name:
-                    svd_mlp.up_u_proj.weight.data = svd_u
-                    svd_mlp.up_v_proj.weight.data = svd_v
+                    _assign_factorized_weights(svd_mlp.up_u_proj, svd_mlp.up_v_proj, svd_u, svd_v)
                     layer.mlp = svd_mlp
         layer = layer.to(dev)
         if "opt" not in model_name:
@@ -440,7 +442,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, no_truncation=False):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -461,8 +463,8 @@ class local_update:
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
-        # trucation SVD
-        num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+        # truncation-aware rank; no_truncation keeps full spectrum
+        num_s_after_trunc = _target_rank(W.shape[0], W.shape[1], ratio, no_truncation=no_truncation)
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
         if direct_update:
@@ -518,6 +520,7 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument('--no_truncation', action='store_true', help='keep full-rank singular components and rely on mixed-precision bit allocation for compression')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -531,7 +534,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, no_truncation=args.no_truncation)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -546,7 +549,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, no_truncation=args.no_truncation)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -554,7 +557,7 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, no_truncation=args.no_truncation)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:
