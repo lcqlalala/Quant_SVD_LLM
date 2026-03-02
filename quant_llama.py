@@ -323,6 +323,14 @@ if __name__ == '__main__':
         help='Number of calibration mini-batches used to estimate diagonal KFAC factors.'
     )
     parser.add_argument(
+        '--mp-kfac-grad-checkpointing', action='store_true',
+        help='Enable gradient checkpointing during K-FAC stats collection to reduce activation memory.'
+    )
+    parser.add_argument(
+        '--mp-kfac-layerwise', action='store_true',
+        help='Collect K-FAC stats layer-by-layer (register hooks per layer group) to reduce peak memory.'
+    )
+    parser.add_argument(
         '--mp-kfac-mode', type=str, default='block_b', choices=['block_b', 'diag', 'sigma_full'],
         help='KFAC approximation used for component importance.'
     )
@@ -440,6 +448,8 @@ if __name__ == '__main__':
                 collect_a_diag=(args.mp_a_mode != "identity"),
                 shrink_lambda=args.mp_b_shrinkage,
                 diag_damp=args.mp_b_damp,
+                use_grad_checkpointing=args.mp_kfac_grad_checkpointing,
+                layerwise=args.mp_kfac_layerwise,
             )
             importance = compute_component_importance_block_b(
                 pairs=pairs,
@@ -463,6 +473,8 @@ if __name__ == '__main__':
                 dataloader=dataloader,
                 device=args.DEV,
                 nsamples=args.mp_kfac_nsamples,
+                use_grad_checkpointing=args.mp_kfac_grad_checkpointing,
+                layerwise=args.mp_kfac_layerwise,
             )
             importance = compute_component_importance(pairs, stats)
             alloc = solve_budgeted_topk(
@@ -492,6 +504,8 @@ if __name__ == '__main__':
                 device=args.DEV,
                 nsamples=args.mp_kfac_nsamples,
                 whiten_inv=whiten_inv,
+                use_grad_checkpointing=args.mp_kfac_grad_checkpointing,
+                layerwise=args.mp_kfac_layerwise,
             )
             fisher_sigma = compute_sigma_fisher_full(pairs, stats)
             alloc = solve_budgeted_topk_quadratic(

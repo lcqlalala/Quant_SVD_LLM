@@ -136,18 +136,54 @@ def build_pair_whiten_inv(
     return out
 
 
+def _group_pairs_by_layer(pairs: List[PairModules]) -> List[List[PairModules]]:
+    groups: Dict[int, List[PairModules]] = {}
+    for pair in pairs:
+        layer_idx = _extract_layer_index(pair.parent_path)
+        key = -1 if layer_idx is None else layer_idx
+        groups.setdefault(key, []).append(pair)
+    return [groups[k] for k in sorted(groups.keys())]
+
+
+def _prepare_kfac_mode(model: nn.Module, use_grad_checkpointing: bool):
+    use_cache = getattr(model.config, "use_cache", False)
+    prev_training = model.training
+    model.config.use_cache = False
+    gc_enabled = False
+    if use_grad_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.train()
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        gc_enabled = True
+    else:
+        model.eval()
+    return use_cache, prev_training, gc_enabled
+
+
+def _restore_kfac_mode(model: nn.Module, use_cache: bool, prev_training: bool, gc_enabled: bool):
+    model.zero_grad(set_to_none=True)
+    if gc_enabled and hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    model.config.use_cache = use_cache
+    if prev_training:
+        model.train()
+    else:
+        model.eval()
+
+
 def collect_kfac_stats_diagonal(
     model: nn.Module,
     pairs: List[PairModules],
     dataloader,
     device: str = "cuda",
     nsamples: int = 8,
+    use_grad_checkpointing: bool = False,
+    layerwise: bool = False,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
-    handles = []
-    use_cache = getattr(model.config, "use_cache", False)
-    model.config.use_cache = False
-    model.eval()
+    use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
 
     for pair in pairs:
         in_dim = pair.v_module.in_features
@@ -179,19 +215,26 @@ def collect_kfac_stats_diagonal(
 
             return _hook
 
-        handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
-        handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
+    pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
+    for subset in pair_subsets:
+        handles = []
+        for pair in subset:
+            handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
+            handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
 
-    for idx, batch in enumerate(dataloader):
-        if idx >= nsamples:
-            break
-        input_ids, labels = batch[0].to(device), batch[1].to(device)
+        for idx, batch in enumerate(dataloader):
+            if idx >= nsamples:
+                break
+            input_ids, labels = batch[0].to(device), batch[1].to(device)
+            model.zero_grad(set_to_none=True)
+            out = model(input_ids=input_ids, labels=labels, use_cache=False)
+            out.loss.backward()
+
+        for h in handles:
+            h.remove()
         model.zero_grad(set_to_none=True)
-        out = model(input_ids=input_ids, labels=labels, use_cache=False)
-        out.loss.backward()
-
-    for h in handles:
-        h.remove()
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     for key, v in stats.items():
         ca = max(v["count_a"].item(), 1.0)
@@ -201,8 +244,7 @@ def collect_kfac_stats_diagonal(
         del v["count_a"]
         del v["count_b"]
 
-    model.zero_grad(set_to_none=True)
-    model.config.use_cache = use_cache
+    _restore_kfac_mode(model, use_cache, prev_training, gc_enabled)
     return stats
 
 
@@ -216,12 +258,11 @@ def collect_kfac_stats_block_b(
     collect_a_diag: bool = True,
     shrink_lambda: float = 0.1,
     diag_damp: float = 1e-6,
+    use_grad_checkpointing: bool = False,
+    layerwise: bool = False,
 ) -> Dict[str, Dict[str, object]]:
     stats: Dict[str, Dict[str, object]] = {}
-    handles = []
-    use_cache = getattr(model.config, "use_cache", False)
-    model.config.use_cache = False
-    model.eval()
+    use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
 
     for pair in pairs:
         out_dim = pair.u_module.out_features
@@ -265,19 +306,26 @@ def collect_kfac_stats_block_b(
 
             return _hook
 
-        handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
-        handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
+    pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
+    for subset in pair_subsets:
+        handles = []
+        for pair in subset:
+            handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
+            handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
 
-    for idx, batch in enumerate(dataloader):
-        if idx >= nsamples:
-            break
-        input_ids, labels = batch[0].to(device), batch[1].to(device)
+        for idx, batch in enumerate(dataloader):
+            if idx >= nsamples:
+                break
+            input_ids, labels = batch[0].to(device), batch[1].to(device)
+            model.zero_grad(set_to_none=True)
+            out = model(input_ids=input_ids, labels=labels, use_cache=False)
+            out.loss.backward()
+
+        for h in handles:
+            h.remove()
         model.zero_grad(set_to_none=True)
-        out = model(input_ids=input_ids, labels=labels, use_cache=False)
-        out.loss.backward()
-
-    for h in handles:
-        h.remove()
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     for key, v in stats.items():
         cb = max(float(v["count_b"]), 1.0)
@@ -297,8 +345,7 @@ def collect_kfac_stats_block_b(
         del v["count_b"]
         del v["count_a"]
 
-    model.zero_grad(set_to_none=True)
-    model.config.use_cache = use_cache
+    _restore_kfac_mode(model, use_cache, prev_training, gc_enabled)
     return stats
 
 
@@ -309,6 +356,8 @@ def collect_kfac_stats_sigma_full(
     device: str = "cuda",
     nsamples: int = 8,
     whiten_inv: Optional[Dict[str, torch.Tensor]] = None,
+    use_grad_checkpointing: bool = False,
+    layerwise: bool = False,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     """
     Collect K-FAC moments projected to rank-space bases:
@@ -317,10 +366,7 @@ def collect_kfac_stats_sigma_full(
       F_sigma = G_sigma * A_sigma (Hadamard product).
     """
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
-    handles = []
-    use_cache = getattr(model.config, "use_cache", False)
-    model.config.use_cache = False
-    model.eval()
+    use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
 
     for pair in pairs:
         rank = pair.u_module.weight.shape[1]
@@ -357,19 +403,26 @@ def collect_kfac_stats_sigma_full(
 
             return _hook
 
-        handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
-        handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
+    pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
+    for subset in pair_subsets:
+        handles = []
+        for pair in subset:
+            handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
+            handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
 
-    for idx, batch in enumerate(dataloader):
-        if idx >= nsamples:
-            break
-        input_ids, labels = batch[0].to(device), batch[1].to(device)
+        for idx, batch in enumerate(dataloader):
+            if idx >= nsamples:
+                break
+            input_ids, labels = batch[0].to(device), batch[1].to(device)
+            model.zero_grad(set_to_none=True)
+            out = model(input_ids=input_ids, labels=labels, use_cache=False)
+            out.loss.backward()
+
+        for h in handles:
+            h.remove()
         model.zero_grad(set_to_none=True)
-        out = model(input_ids=input_ids, labels=labels, use_cache=False)
-        out.loss.backward()
-
-    for h in handles:
-        h.remove()
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     for key, v in stats.items():
         ca = max(v["count_a"].item(), 1.0)
@@ -379,8 +432,7 @@ def collect_kfac_stats_sigma_full(
         del v["count_a"]
         del v["count_g"]
 
-    model.zero_grad(set_to_none=True)
-    model.config.use_cache = use_cache
+    _restore_kfac_mode(model, use_cache, prev_training, gc_enabled)
     return stats
 
 
