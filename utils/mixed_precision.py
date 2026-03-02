@@ -173,6 +173,39 @@ def _restore_kfac_mode(model: nn.Module, use_cache: bool, prev_training: bool, g
         model.eval()
 
 
+def _compute_sigma_component_norms(
+    u_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    u_norm = torch.linalg.vector_norm(u_weight.float(), dim=0)
+    v_norm = torch.linalg.vector_norm(v_weight.float(), dim=1)
+    sigma = u_norm * v_norm
+    active = sigma > eps
+    u_scale = torch.where(active, u_norm, torch.ones_like(u_norm))
+    v_scale = torch.where(active, v_norm, torch.ones_like(v_norm))
+    return u_norm, v_norm, sigma, active, u_scale, v_scale
+
+
+def _decompose_uv_to_explicit_sigma(
+    u_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    eps: float = 1e-12,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, _, sigma, active, u_scale, v_scale = _compute_sigma_component_norms(
+        u_weight=u_weight,
+        v_weight=v_weight,
+        eps=eps,
+    )
+    u_basis = u_weight.float() / u_scale.unsqueeze(0)
+    v_basis = v_weight.float() / v_scale.unsqueeze(1)
+    if torch.any(~active):
+        u_basis[:, ~active] = 0.0
+        v_basis[~active, :] = 0.0
+        sigma = torch.where(active, sigma, torch.zeros_like(sigma))
+    return u_basis, sigma, v_basis, active
+
+
 def collect_kfac_stats_diagonal(
     model: nn.Module,
     pairs: List[PairModules],
@@ -358,6 +391,8 @@ def collect_kfac_stats_sigma_full(
     whiten_inv: Optional[Dict[str, torch.Tensor]] = None,
     use_grad_checkpointing: bool = False,
     layerwise: bool = False,
+    explicit_sigma: bool = False,
+    sigma_eps: float = 1e-12,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     """
     Collect K-FAC moments projected to rank-space bases:
@@ -367,6 +402,7 @@ def collect_kfac_stats_sigma_full(
     """
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
+    explicit_meta: Dict[str, Dict[str, torch.Tensor]] = {}
 
     for pair in pairs:
         rank = pair.u_module.weight.shape[1]
@@ -376,6 +412,17 @@ def collect_kfac_stats_sigma_full(
             "count_a": torch.tensor(0.0, dtype=torch.float64),
             "count_g": torch.tensor(0.0, dtype=torch.float64),
         }
+        if explicit_sigma:
+            _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
+                u_weight=pair.u_module.weight.detach(),
+                v_weight=pair.v_module.weight.detach(),
+                eps=sigma_eps,
+            )
+            explicit_meta[pair.key] = {
+                "active": active.cpu(),
+                "u_scale": u_scale.cpu(),
+                "v_scale": v_scale.cpu(),
+            }
 
         def mk_fwd_pre(k):
             def _hook(module, inputs):
@@ -386,6 +433,11 @@ def collect_kfac_stats_sigma_full(
                 # module is *_v_proj with shape [rank, in_dim]
                 V = module.weight.detach().float()
                 z = x_flat.matmul(V.transpose(0, 1))
+                if explicit_sigma and k in explicit_meta:
+                    v_scale = explicit_meta[k]["v_scale"].to(device=z.device, dtype=z.dtype)
+                    active = explicit_meta[k]["active"].to(device=z.device, dtype=z.dtype)
+                    z = z / v_scale.unsqueeze(0)
+                    z = z * active.unsqueeze(0)
                 stats[k]["A_proj"] += z.transpose(0, 1).matmul(z).to(dtype=torch.float64).cpu()
                 stats[k]["count_a"] += z.new_tensor(float(z.shape[0]), dtype=torch.float64).cpu()
 
@@ -398,6 +450,11 @@ def collect_kfac_stats_sigma_full(
                 # module is *_u_proj with shape [out_dim, rank]
                 U = module.weight.detach().float()
                 s = g_flat.matmul(U)
+                if explicit_sigma and k in explicit_meta:
+                    u_scale = explicit_meta[k]["u_scale"].to(device=s.device, dtype=s.dtype)
+                    active = explicit_meta[k]["active"].to(device=s.device, dtype=s.dtype)
+                    s = s / u_scale.unsqueeze(0)
+                    s = s * active.unsqueeze(0)
                 stats[k]["G_proj"] += s.transpose(0, 1).matmul(s).to(dtype=torch.float64).cpu()
                 stats[k]["count_g"] += s.new_tensor(float(s.shape[0]), dtype=torch.float64).cpu()
 
@@ -593,11 +650,12 @@ def _estimate_sigma_proxy(pair: PairModules) -> torch.Tensor:
     Rank-component magnitude proxy in low-rank chain W = U V.
     For component i, ||u_i v_i^T||_F = ||u_i|| * ||v_i||.
     """
-    U = pair.u_module.weight.data.float()
-    V = pair.v_module.weight.data.float()
-    u_norm = torch.linalg.vector_norm(U, dim=0)
-    v_norm = torch.linalg.vector_norm(V, dim=1)
-    return (u_norm * v_norm).clamp_min(1e-12).cpu()
+    _, _, sigma, _, _, _ = _compute_sigma_component_norms(
+        u_weight=pair.u_module.weight.data,
+        v_weight=pair.v_module.weight.data,
+        eps=0.0,
+    )
+    return sigma.cpu()
 
 
 def solve_budgeted_topk_quadratic(
@@ -607,6 +665,7 @@ def solve_budgeted_topk_quadratic(
     high_bit: int = 8,
     avg_bit: float = 4.5,
     sigma_calib: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+    sigma_eps: float = 1e-12,
 ) -> Dict[str, torch.Tensor]:
     """
     Budgeted greedy selection with sigma-space quadratic objective:
@@ -643,7 +702,7 @@ def solve_budgeted_topk_quadratic(
             low_vec = torch.full((rank,), noise_low, dtype=torch.float32)
             high_vec = torch.full((rank,), noise_high, dtype=torch.float32)
 
-        active = sigma_vec > 1e-12
+        active = sigma_vec > sigma_eps
         active_count = int(active.sum().item())
         if active_count == 0:
             continue
@@ -739,17 +798,38 @@ def calibrate_component_sigma(
     pairs: List[PairModules],
     low_bit: int = 4,
     high_bit: int = 8,
+    explicit_sigma: bool = False,
+    sigma_eps: float = 1e-12,
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     sigma: Dict[str, Dict[str, torch.Tensor]] = {}
     for pair in pairs:
         U = pair.u_module.weight.data.float().cpu()
         V = pair.v_module.weight.data.float().cpu()
+        U_basis = None
+        V_basis = None
+        sigma_vec = None
+        active = None
+        if explicit_sigma:
+            U_basis, sigma_vec, V_basis, active = _decompose_uv_to_explicit_sigma(
+                u_weight=U,
+                v_weight=V,
+                eps=sigma_eps,
+            )
         rank = U.shape[1]
         low = torch.zeros(rank, dtype=torch.float32)
         high = torch.zeros(rank, dtype=torch.float32)
         for i in range(rank):
-            u = U[:, i]
-            v = V[i, :]
+            if explicit_sigma:
+                if active is None or sigma_vec is None or U_basis is None or V_basis is None:
+                    continue
+                if not bool(active[i].item()):
+                    continue
+                root_sigma = math.sqrt(max(float(sigma_vec[i].item()), 0.0))
+                u = U_basis[:, i] * root_sigma
+                v = V_basis[i, :] * root_sigma
+            else:
+                u = U[:, i]
+                v = V[i, :]
             uq_l = _quantize_vec_symmetric(u, low_bit)
             vq_l = _quantize_vec_symmetric(v, low_bit)
             uq_h = _quantize_vec_symmetric(u, high_bit)
@@ -870,12 +950,147 @@ class TwoPathLowRankLinear(nn.Module):
         return out
 
 
+class TwoPathSigmaLowRankLinear(nn.Module):
+    def __init__(
+        self,
+        u_basis: torch.Tensor,
+        v_basis: torch.Tensor,
+        sigma: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        high_idx: torch.Tensor,
+        low_idx: torch.Tensor,
+        high_bit: int = 8,
+        low_bit: int = 4,
+    ):
+        super().__init__()
+        self.high_bit = high_bit
+        self.low_bit = low_bit
+        self.out_features = u_basis.shape[0]
+        self.in_features = v_basis.shape[1]
+        self._runtime_u: Optional[torch.Tensor] = None
+        self._runtime_v: Optional[torch.Tensor] = None
+        self._runtime_sigma: Optional[torch.Tensor] = None
+        self._runtime_device: Optional[torch.device] = None
+        self._runtime_dtype: Optional[torch.dtype] = None
+        self.register_buffer("high_idx", high_idx.to(torch.long), persistent=False)
+        self.register_buffer("low_idx", low_idx.to(torch.long), persistent=False)
+
+        if self.high_idx.numel() > 0:
+            uh = u_basis[:, self.high_idx]
+            vh = v_basis[self.high_idx, :]
+            sh = sigma[self.high_idx].float().cpu()
+            self.register_buffer("uh_q", self._q_per_row(uh, high_bit)[0], persistent=True)
+            self.register_buffer("uh_s", self._q_per_row(uh, high_bit)[1], persistent=True)
+            self.register_buffer("vh_q", self._q_per_row(vh, high_bit)[0], persistent=True)
+            self.register_buffer("vh_s", self._q_per_row(vh, high_bit)[1], persistent=True)
+            self.register_buffer("sh", sh, persistent=True)
+        else:
+            self.register_buffer("uh_q", torch.empty(0, dtype=torch.int8), persistent=True)
+            self.register_buffer("uh_s", torch.empty(0), persistent=True)
+            self.register_buffer("vh_q", torch.empty(0, dtype=torch.int8), persistent=True)
+            self.register_buffer("vh_s", torch.empty(0), persistent=True)
+            self.register_buffer("sh", torch.empty(0), persistent=True)
+
+        if self.low_idx.numel() > 0:
+            ul = u_basis[:, self.low_idx]
+            vl = v_basis[self.low_idx, :]
+            sl = sigma[self.low_idx].float().cpu()
+            self.register_buffer("ul_q", self._q_per_row(ul, low_bit)[0], persistent=True)
+            self.register_buffer("ul_s", self._q_per_row(ul, low_bit)[1], persistent=True)
+            self.register_buffer("vl_q", self._q_per_row(vl, low_bit)[0], persistent=True)
+            self.register_buffer("vl_s", self._q_per_row(vl, low_bit)[1], persistent=True)
+            self.register_buffer("sl", sl, persistent=True)
+        else:
+            self.register_buffer("ul_q", torch.empty(0, dtype=torch.int8), persistent=True)
+            self.register_buffer("ul_s", torch.empty(0), persistent=True)
+            self.register_buffer("vl_q", torch.empty(0, dtype=torch.int8), persistent=True)
+            self.register_buffer("vl_s", torch.empty(0), persistent=True)
+            self.register_buffer("sl", torch.empty(0), persistent=True)
+
+        if bias is None:
+            self.register_buffer("bias", None, persistent=True)
+        else:
+            self.register_buffer("bias", bias.detach().clone().float(), persistent=True)
+
+    @staticmethod
+    def _q_per_row(w: torch.Tensor, bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        qmax = float((2 ** (bits - 1)) - 1)
+        w = w.float()
+        s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / qmax
+        q = torch.round(w / s).clamp(-qmax, qmax).to(torch.int8)
+        return q.cpu(), s.squeeze(1).cpu()
+
+    @staticmethod
+    def _deq_per_row(q: torch.Tensor, s: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if q.numel() == 0:
+            return torch.empty(0, device=device, dtype=dtype)
+        qf = q.to(device=device, dtype=torch.float32)
+        sf = s.to(device=device, dtype=torch.float32).unsqueeze(1)
+        return (qf * sf).to(dtype=dtype)
+
+    def _build_runtime_cache(self, device: torch.device, dtype: torch.dtype):
+        if (
+            self._runtime_u is not None
+            and self._runtime_v is not None
+            and self._runtime_sigma is not None
+            and self._runtime_device == device
+            and self._runtime_dtype == dtype
+        ):
+            return
+        parts_u = []
+        parts_v = []
+        parts_sigma = []
+        if self.uh_q.numel() > 0:
+            parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
+            parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
+            parts_sigma.append(self.sh.to(device=device, dtype=dtype))
+        if self.ul_q.numel() > 0:
+            parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
+            parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
+            parts_sigma.append(self.sl.to(device=device, dtype=dtype))
+        if len(parts_u) == 0:
+            self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
+            self._runtime_v = torch.zeros((0, self.in_features), device=device, dtype=dtype)
+            self._runtime_sigma = torch.zeros((0,), device=device, dtype=dtype)
+        elif len(parts_u) == 1:
+            self._runtime_u = parts_u[0]
+            self._runtime_v = parts_v[0]
+            self._runtime_sigma = parts_sigma[0]
+        else:
+            self._runtime_u = torch.cat(parts_u, dim=1)
+            self._runtime_v = torch.cat(parts_v, dim=0)
+            self._runtime_sigma = torch.cat(parts_sigma, dim=0)
+        self._runtime_device = device
+        self._runtime_dtype = dtype
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        dev = x.device
+        self._build_runtime_cache(dev, dtype)
+        if (
+            self._runtime_u is None
+            or self._runtime_v is None
+            or self._runtime_sigma is None
+            or self._runtime_v.numel() == 0
+        ):
+            out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
+        else:
+            z = F.linear(x, self._runtime_v)
+            z = z * self._runtime_sigma
+            out = F.linear(z, self._runtime_u)
+        if self.bias is not None:
+            out = out + self.bias.to(device=dev, dtype=dtype)
+        return out
+
+
 def apply_two_path_quantization(
     model: nn.Module,
     pairs: List[PairModules],
     alloc: Dict[str, torch.Tensor],
     high_bit: int = 8,
     low_bit: int = 4,
+    explicit_sigma: bool = False,
+    sigma_eps: float = 1e-12,
 ):
     for pair in pairs:
         if pair.key not in alloc:
@@ -887,14 +1102,31 @@ def apply_two_path_quantization(
         if high_idx.numel() == 0 and low_idx.numel() == 0 and rank > 0:
             low_idx = torch.arange(rank)
 
-        mp = TwoPathLowRankLinear(
-            u_weight=pair.u_module.weight.data,
-            v_weight=pair.v_module.weight.data,
-            bias=pair.u_module.bias.data if pair.u_module.bias is not None else None,
-            high_idx=high_idx,
-            low_idx=low_idx,
-            high_bit=high_bit,
-            low_bit=low_bit,
-        )
+        if explicit_sigma:
+            u_basis, sigma_vec, v_basis, _ = _decompose_uv_to_explicit_sigma(
+                u_weight=pair.u_module.weight.data.detach().float().cpu(),
+                v_weight=pair.v_module.weight.data.detach().float().cpu(),
+                eps=sigma_eps,
+            )
+            mp = TwoPathSigmaLowRankLinear(
+                u_basis=u_basis,
+                v_basis=v_basis,
+                sigma=sigma_vec,
+                bias=pair.u_module.bias.data if pair.u_module.bias is not None else None,
+                high_idx=high_idx,
+                low_idx=low_idx,
+                high_bit=high_bit,
+                low_bit=low_bit,
+            )
+        else:
+            mp = TwoPathLowRankLinear(
+                u_weight=pair.u_module.weight.data,
+                v_weight=pair.v_module.weight.data,
+                bias=pair.u_module.bias.data if pair.u_module.bias is not None else None,
+                high_idx=high_idx,
+                low_idx=low_idx,
+                high_bit=high_bit,
+                low_bit=low_bit,
+            )
         parent = _get_submodule(model, pair.parent_path)
         setattr(parent, f"{pair.stem}_mp_proj", mp)

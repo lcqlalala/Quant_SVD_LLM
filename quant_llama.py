@@ -335,6 +335,14 @@ if __name__ == '__main__':
         help='KFAC approximation used for component importance.'
     )
     parser.add_argument(
+        '--mp-explicit-sigma', action='store_true',
+        help='Use explicit W=U*diag(sigma)*V^T parameterization for sigma-space Fisher and MP quantization.'
+    )
+    parser.add_argument(
+        '--mp-sigma-eps', type=float, default=1e-12,
+        help='Numerical epsilon used for explicit sigma decomposition and active component masking.'
+    )
+    parser.add_argument(
         '--mp-use-whiten', action='store_true',
         help='Use whitening matrix R^{-1} to whiten activations before sigma-space KFAC projection.'
     )
@@ -435,6 +443,8 @@ if __name__ == '__main__':
                 pairs=pairs,
                 low_bit=args.mp_low_bit,
                 high_bit=args.mp_high_bit,
+                explicit_sigma=args.mp_explicit_sigma,
+                sigma_eps=args.mp_sigma_eps,
             )
 
         if args.mp_kfac_mode == "block_b":
@@ -506,6 +516,8 @@ if __name__ == '__main__':
                 whiten_inv=whiten_inv,
                 use_grad_checkpointing=args.mp_kfac_grad_checkpointing,
                 layerwise=args.mp_kfac_layerwise,
+                explicit_sigma=args.mp_explicit_sigma,
+                sigma_eps=args.mp_sigma_eps,
             )
             fisher_sigma = compute_sigma_fisher_full(pairs, stats)
             alloc = solve_budgeted_topk_quadratic(
@@ -515,6 +527,7 @@ if __name__ == '__main__':
                 high_bit=args.mp_high_bit,
                 avg_bit=args.mp_avg_bit,
                 sigma_calib=sigma_calib,
+                sigma_eps=args.mp_sigma_eps,
             )
         report_mixed_precision_allocation(pairs, alloc)
         apply_two_path_quantization(
@@ -523,6 +536,8 @@ if __name__ == '__main__':
             alloc=alloc,
             high_bit=args.mp_high_bit,
             low_bit=args.mp_low_bit,
+            explicit_sigma=args.mp_explicit_sigma,
+            sigma_eps=args.mp_sigma_eps,
         )
     elif args.wbits < 16 and not args.nearest:
         tick = time.time()
