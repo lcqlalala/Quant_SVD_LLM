@@ -267,6 +267,10 @@ if __name__ == '__main__':
         help='path of the compressed model.'
     )
     parser.add_argument(
+        '--model-dtype', type=str, default='fp16', choices=['fp32', 'fp16', 'bf16'],
+        help='Model dtype cast before moving to device. fp16 is recommended for OOM mitigation.'
+    )
+    parser.add_argument(
         '--tokenizer_path', type=str, default=None,
         help='Optional tokenizer/model path or repo id when checkpoint does not include tokenizer.'
     )
@@ -281,6 +285,10 @@ if __name__ == '__main__':
     parser.add_argument(
         '--nsamples', type=int, default=128,
         help='Number of calibration data samples.'
+    )
+    parser.add_argument(
+        '--model_seq_len', type=int, default=2048,
+        help='Sequence length used for calibration/evaluation loaders.'
     )
     parser.add_argument(
         '--percdamp', type=float, default=.01,
@@ -391,9 +399,21 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     model, tokenizer = get_model_from_local(args.model_path, tokenizer_path=args.tokenizer_path)
+    if args.model_dtype == "fp16":
+        model = model.half()
+    elif args.model_dtype == "bf16":
+        model = model.bfloat16()
+    else:
+        model = model.float()
     model.eval()
     
-    dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, tokenizer=tokenizer)
+    dataloader, testloader = get_loaders(
+        args.dataset,
+        nsamples=args.nsamples,
+        seed=args.seed,
+        tokenizer=tokenizer,
+        seqlen=args.model_seq_len,
+    )
 
     if args.mp_enable:
         model = model.to(args.DEV)
@@ -497,7 +517,7 @@ if __name__ == '__main__':
     # if args.save:
     #     llama_pack3(model, quantizers)
     #     torch.save(model.state_dict(), args.save)
-    ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=2048, batch_size=16, device=args.DEV)
+    ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=16, device=args.DEV)
     if args.save:
         torch.save(
             {
