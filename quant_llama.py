@@ -267,6 +267,10 @@ if __name__ == '__main__':
         help='path of the compressed model.'
     )
     parser.add_argument(
+        '--tokenizer_path', type=str, default=None,
+        help='Optional tokenizer/model path or repo id when checkpoint does not include tokenizer.'
+    )
+    parser.add_argument(
         '--dataset', type=str, choices=['wikitext2', 'ptb', 'c4'],
         help='Where to extract calibration data from.'
     )
@@ -386,7 +390,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    model, tokenizer = get_model_from_local(args.model_path)
+    model, tokenizer = get_model_from_local(args.model_path, tokenizer_path=args.tokenizer_path)
     model.eval()
     
     dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, tokenizer=tokenizer)
