@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 import time
 
@@ -260,42 +259,6 @@ def report_mixed_precision_allocation(pairs, alloc):
     print(f"Mixed-precision allocation: high={high}, low={low}, total={total}")
 
 
-@torch.no_grad()
-def save_mp_stage_checkpoint(
-    save_dir: str,
-    stage_idx: int,
-    stage_name: str,
-    model: nn.Module,
-    tokenizer=None,
-    save_full_model: bool = False,
-    save_tokenizer: bool = False,
-    extra: dict = None,
-):
-    if not save_dir:
-        return
-    os.makedirs(save_dir, exist_ok=True)
-    safe_stage = re.sub(r"[^0-9A-Za-z_.-]+", "_", stage_name)
-    ckpt_path = os.path.join(save_dir, f"{stage_idx:02d}_{safe_stage}.pt")
-    if save_full_model:
-        payload = {
-            "stage_idx": stage_idx,
-            "stage_name": stage_name,
-            "model": model,
-        }
-    else:
-        payload = {
-            "stage_idx": stage_idx,
-            "stage_name": stage_name,
-            "model_state_dict": model.state_dict(),
-        }
-    if save_tokenizer and tokenizer is not None:
-        payload["tokenizer"] = tokenizer
-    if extra is not None:
-        payload["extra"] = extra
-    torch.save(payload, ckpt_path)
-    print(f"Saved stage checkpoint: {ckpt_path}")
-
-
 if __name__ == '__main__':
     import argparse
     from utils.data_utils import *
@@ -435,18 +398,6 @@ if __name__ == '__main__':
         help='Target average bit-width under budgeted top-k selection.'
     )
     parser.add_argument(
-        '--mp-stage-save-dir', type=str, default='',
-        help='Optional directory to save stage checkpoints during mixed-precision pipeline.'
-    )
-    parser.add_argument(
-        '--mp-stage-save-full-model', action='store_true',
-        help='Save full model object in stage checkpoints. Default saves state_dict only.'
-    )
-    parser.add_argument(
-        '--mp-stage-save-tokenizer', action='store_true',
-        help='Also save tokenizer in stage checkpoints.'
-    )
-    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -489,20 +440,8 @@ if __name__ == '__main__':
             mp_stages.append("sigma_calibration")
         mp_stages.extend(["kfac_stats", "allocation", "apply_quantization"])
         mp_bar = tqdm(total=len(mp_stages), desc="MP pipeline", dynamic_ncols=True)
-        stage_idx = [0]
 
-        def finish_stage(stage_name: str, extra: dict = None):
-            stage_idx[0] += 1
-            save_mp_stage_checkpoint(
-                save_dir=args.mp_stage_save_dir,
-                stage_idx=stage_idx[0],
-                stage_name=stage_name,
-                model=model,
-                tokenizer=tokenizer,
-                save_full_model=args.mp_stage_save_full_model,
-                save_tokenizer=args.mp_stage_save_tokenizer,
-                extra=extra,
-            )
+        def finish_stage(stage_name: str):
             mp_bar.set_postfix_str(stage_name)
             mp_bar.update(1)
 
@@ -511,7 +450,7 @@ if __name__ == '__main__':
         if len(pairs) == 0:
             raise RuntimeError("No low-rank *_u_proj/*_v_proj pairs found. Please use an SVD-compressed model.")
         print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision. mode={args.mp_kfac_mode}")
-        finish_stage("discover_pairs", extra={"num_pairs": len(pairs)})
+        finish_stage("discover_pairs")
 
         sigma_calib = None
         if args.mp_sigma_mode == "calibrated":
@@ -606,7 +545,7 @@ if __name__ == '__main__':
                 sigma_calib=sigma_calib,
                 sigma_eps=args.mp_sigma_eps,
             )
-        finish_stage("kfac_stats", extra={"kfac_mode": args.mp_kfac_mode})
+        finish_stage("kfac_stats")
         finish_stage("allocation")
 
         report_mixed_precision_allocation(pairs, alloc)
