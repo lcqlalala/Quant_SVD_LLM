@@ -266,8 +266,6 @@ def collect_kfac_stats_diagonal(
         for h in handles:
             h.remove()
         model.zero_grad(set_to_none=True)
-        if str(device).startswith("cuda"):
-            torch.cuda.empty_cache()
 
     for key, v in stats.items():
         ca = max(v["count_a"].item(), 1.0)
@@ -296,6 +294,7 @@ def collect_kfac_stats_block_b(
 ) -> Dict[str, Dict[str, object]]:
     stats: Dict[str, Dict[str, object]] = {}
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
+    accum_device = torch.device(device)
 
     for pair in pairs:
         out_dim = pair.u_module.out_features
@@ -305,13 +304,13 @@ def collect_kfac_stats_block_b(
             "out_dim": out_dim,
             "B_blocks": [],
             "count_b": 0.0,
-            "A_diag": torch.zeros(pair.v_module.in_features, dtype=torch.float64),
+            "A_diag": torch.zeros(pair.v_module.in_features, dtype=torch.float32, device=accum_device),
             "count_a": 0.0,
         }
         for bi in range(nblocks):
             s = bi * block_size
             e = min((bi + 1) * block_size, out_dim)
-            stats[pair.key]["B_blocks"].append(torch.zeros((e - s, e - s), dtype=torch.float64))
+            stats[pair.key]["B_blocks"].append(torch.zeros((e - s, e - s), dtype=torch.float32, device=accum_device))
 
         def mk_fwd_pre(k):
             def _hook(module, inputs):
@@ -319,7 +318,7 @@ def collect_kfac_stats_block_b(
                     return
                 x = inputs[0].detach().float()
                 x_flat = x.reshape(-1, x.shape[-1])
-                stats[k]["A_diag"] += x_flat.pow(2).sum(dim=0).to(dtype=torch.float64).cpu()
+                stats[k]["A_diag"] += x_flat.pow(2).sum(dim=0)
                 stats[k]["count_a"] += float(x_flat.shape[0])
 
             return _hook
@@ -334,7 +333,7 @@ def collect_kfac_stats_block_b(
                     s = bi * bsz
                     e = min((bi + 1) * bsz, g_flat.shape[-1])
                     gb = g_flat[:, s:e]
-                    cov = gb.transpose(0, 1).matmul(gb).to(dtype=torch.float64).cpu()
+                    cov = gb.transpose(0, 1).matmul(gb).to(dtype=torch.float32)
                     stats[k]["B_blocks"][bi].add_(cov)
 
             return _hook
@@ -357,8 +356,6 @@ def collect_kfac_stats_block_b(
         for h in handles:
             h.remove()
         model.zero_grad(set_to_none=True)
-        if str(device).startswith("cuda"):
-            torch.cuda.empty_cache()
 
     for key, v in stats.items():
         cb = max(float(v["count_b"]), 1.0)
@@ -369,10 +366,10 @@ def collect_kfac_stats_block_b(
                 blk = (1.0 - shrink_lambda) * blk + shrink_lambda * blk_diag
             if diag_damp > 0:
                 blk = blk + diag_damp * torch.eye(blk.shape[0], dtype=blk.dtype)
-            v["B_blocks"][bi] = blk
+            v["B_blocks"][bi] = blk.cpu()
         ca = max(float(v["count_a"]), 1.0)
         if collect_a_diag:
-            v["A_diag"] = (v["A_diag"] / ca).float()
+            v["A_diag"] = (v["A_diag"] / ca).float().cpu()
         else:
             v["A_diag"] = None
         del v["count_b"]
@@ -402,15 +399,16 @@ def collect_kfac_stats_sigma_full(
     """
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
+    accum_device = torch.device(device)
     explicit_meta: Dict[str, Dict[str, torch.Tensor]] = {}
 
     for pair in pairs:
         rank = pair.u_module.weight.shape[1]
         stats[pair.key] = {
-            "A_proj": torch.zeros((rank, rank), dtype=torch.float64),
-            "G_proj": torch.zeros((rank, rank), dtype=torch.float64),
-            "count_a": torch.tensor(0.0, dtype=torch.float64),
-            "count_g": torch.tensor(0.0, dtype=torch.float64),
+            "A_proj": torch.zeros((rank, rank), dtype=torch.float32, device=accum_device),
+            "G_proj": torch.zeros((rank, rank), dtype=torch.float32, device=accum_device),
+            "count_a": 0.0,
+            "count_g": 0.0,
         }
         if explicit_sigma:
             _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
@@ -419,9 +417,9 @@ def collect_kfac_stats_sigma_full(
                 eps=sigma_eps,
             )
             explicit_meta[pair.key] = {
-                "active": active.cpu(),
-                "u_scale": u_scale.cpu(),
-                "v_scale": v_scale.cpu(),
+                "active": active.to(device=accum_device, dtype=torch.float32),
+                "u_scale": u_scale.to(device=accum_device, dtype=torch.float32),
+                "v_scale": v_scale.to(device=accum_device, dtype=torch.float32),
             }
 
         def mk_fwd_pre(k):
@@ -438,8 +436,8 @@ def collect_kfac_stats_sigma_full(
                     active = explicit_meta[k]["active"].to(device=z.device, dtype=z.dtype)
                     z = z / v_scale.unsqueeze(0)
                     z = z * active.unsqueeze(0)
-                stats[k]["A_proj"] += z.transpose(0, 1).matmul(z).to(dtype=torch.float64).cpu()
-                stats[k]["count_a"] += z.new_tensor(float(z.shape[0]), dtype=torch.float64).cpu()
+                stats[k]["A_proj"] += z.transpose(0, 1).matmul(z).to(dtype=torch.float32)
+                stats[k]["count_a"] += float(z.shape[0])
 
             return _hook
 
@@ -455,8 +453,8 @@ def collect_kfac_stats_sigma_full(
                     active = explicit_meta[k]["active"].to(device=s.device, dtype=s.dtype)
                     s = s / u_scale.unsqueeze(0)
                     s = s * active.unsqueeze(0)
-                stats[k]["G_proj"] += s.transpose(0, 1).matmul(s).to(dtype=torch.float64).cpu()
-                stats[k]["count_g"] += s.new_tensor(float(s.shape[0]), dtype=torch.float64).cpu()
+                stats[k]["G_proj"] += s.transpose(0, 1).matmul(s).to(dtype=torch.float32)
+                stats[k]["count_g"] += float(s.shape[0])
 
             return _hook
 
@@ -478,12 +476,10 @@ def collect_kfac_stats_sigma_full(
         for h in handles:
             h.remove()
         model.zero_grad(set_to_none=True)
-        if str(device).startswith("cuda"):
-            torch.cuda.empty_cache()
 
     for key, v in stats.items():
-        ca = max(v["count_a"].item(), 1.0)
-        cg = max(v["count_g"].item(), 1.0)
+        ca = max(float(v["count_a"]), 1.0)
+        cg = max(float(v["count_g"]), 1.0)
         v["A_proj"] = (v["A_proj"] / ca).float().cpu()
         v["G_proj"] = (v["G_proj"] / cg).float().cpu()
         del v["count_a"]
