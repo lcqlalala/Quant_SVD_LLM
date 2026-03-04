@@ -23,6 +23,7 @@ from utils.mixed_precision import (
     discover_low_rank_pairs,
     solve_budgeted_topk,
     solve_budgeted_topk_quadratic,
+    strip_original_low_rank_weights,
 )
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -398,6 +399,10 @@ if __name__ == '__main__':
         help='Target average bit-width under budgeted top-k selection.'
     )
     parser.add_argument(
+        '--mp-disable-int8-kernel', action='store_true',
+        help='Disable int8 GEMM kernel path in two-path quantized layers and force float fallback.'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -434,6 +439,7 @@ if __name__ == '__main__':
         seqlen=args.model_seq_len,
     )
 
+    pairs = None
     if args.mp_enable:
         mp_stages = ["discover_pairs"]
         if args.mp_sigma_mode == "calibrated":
@@ -557,6 +563,7 @@ if __name__ == '__main__':
             low_bit=args.mp_low_bit,
             explicit_sigma=args.mp_explicit_sigma,
             sigma_eps=args.mp_sigma_eps,
+            use_int8_kernel=not args.mp_disable_int8_kernel,
         )
         finish_stage("apply_quantization")
         mp_bar.close()
@@ -569,6 +576,14 @@ if __name__ == '__main__':
     #     torch.save(model.state_dict(), args.save)
     ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=16, device=args.DEV)
     if args.save:
+        if args.mp_enable and pairs is not None:
+            strip_stats = strip_original_low_rank_weights(model=model, pairs=pairs)
+            print(
+                "Stripped original low-rank modules before save: "
+                f"removed_params={strip_stats['removed_params']}, "
+                f"replaced_modules={strip_stats['replaced_modules']}, "
+                f"skipped_pairs={strip_stats['skipped_pairs']}"
+            )
         torch.save(
             {
                 'model': model,

@@ -781,6 +781,30 @@ def _quantize_vec_symmetric(vec: torch.Tensor, bits: int) -> torch.Tensor:
     return q * scale
 
 
+def _can_use_int8_gemm(device: torch.device, use_int8_kernel: bool) -> bool:
+    return bool(use_int8_kernel and device.type == "cuda" and hasattr(torch, "_int_mm"))
+
+
+def _quantize_activation_int8_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = x2d.float()
+    scale = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
+    xq = torch.round(x / scale).clamp(-127, 127).to(torch.int8).contiguous()
+    return xq, scale.squeeze(1).to(torch.float32)
+
+
+def _int8_linear_dynamic_act(
+    x2d: torch.Tensor,
+    weight_q_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    xq, x_scale = _quantize_activation_int8_2d(x2d)
+    y_i32 = torch._int_mm(xq, weight_q_t)
+    y = y_i32.to(torch.float32)
+    y.mul_(x_scale.unsqueeze(1))
+    y.mul_(weight_scale.unsqueeze(0))
+    return y
+
+
 def _rank1_outer_error(u: torch.Tensor, v: torch.Tensor, uq: torch.Tensor, vq: torch.Tensor) -> torch.Tensor:
     uu = torch.dot(u, u)
     vv = torch.dot(v, v)
@@ -846,13 +870,19 @@ class TwoPathLowRankLinear(nn.Module):
         low_idx: torch.Tensor,
         high_bit: int = 8,
         low_bit: int = 4,
+        use_int8_kernel: bool = True,
     ):
         super().__init__()
         self.high_bit = high_bit
         self.low_bit = low_bit
+        self.use_int8_kernel = use_int8_kernel
         self.out_features = u_weight.shape[0]
         self._runtime_u: Optional[torch.Tensor] = None
         self._runtime_v: Optional[torch.Tensor] = None
+        self._runtime_uq_t: Optional[torch.Tensor] = None
+        self._runtime_vq_t: Optional[torch.Tensor] = None
+        self._runtime_us: Optional[torch.Tensor] = None
+        self._runtime_vs: Optional[torch.Tensor] = None
         self._runtime_device: Optional[torch.device] = None
         self._runtime_dtype: Optional[torch.dtype] = None
         self.register_buffer("high_idx", high_idx.to(torch.long), persistent=False)
@@ -907,28 +937,60 @@ class TwoPathLowRankLinear(nn.Module):
         if (
             self._runtime_u is not None
             and self._runtime_v is not None
+            and self._runtime_uq_t is not None
+            and self._runtime_vq_t is not None
+            and self._runtime_us is not None
+            and self._runtime_vs is not None
             and self._runtime_device == device
             and self._runtime_dtype == dtype
         ):
             return
         parts_u = []
         parts_v = []
+        parts_u_q = []
+        parts_v_q = []
+        parts_u_s = []
+        parts_v_s = []
         if self.uh_q.numel() > 0:
             parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
             parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
+            parts_u_q.append(self.uh_q.to(device=device))
+            parts_v_q.append(self.vh_q.to(device=device))
+            parts_u_s.append(self.uh_s.to(device=device, dtype=torch.float32))
+            parts_v_s.append(self.vh_s.to(device=device, dtype=torch.float32))
         if self.ul_q.numel() > 0:
             parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
             parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
+            parts_u_q.append(self.ul_q.to(device=device))
+            parts_v_q.append(self.vl_q.to(device=device))
+            parts_u_s.append(self.ul_s.to(device=device, dtype=torch.float32))
+            parts_v_s.append(self.vl_s.to(device=device, dtype=torch.float32))
         if len(parts_u) == 0:
             self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
             self._runtime_v = torch.zeros((0, 0), device=device, dtype=dtype)
+            self._runtime_uq_t = torch.zeros((0, self.out_features), device=device, dtype=torch.int8)
+            self._runtime_vq_t = torch.zeros((0, 0), device=device, dtype=torch.int8)
+            self._runtime_us = torch.zeros((self.out_features,), device=device, dtype=torch.float32)
+            self._runtime_vs = torch.zeros((0,), device=device, dtype=torch.float32)
         elif len(parts_u) == 1:
             self._runtime_u = parts_u[0]
             self._runtime_v = parts_v[0]
+            u_q = parts_u_q[0]
+            v_q = parts_v_q[0]
+            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_us = parts_u_s[0]
+            self._runtime_vs = parts_v_s[0]
         else:
             # Runtime fuse two paths into one low-rank chain: y = [Uh Ul]([Vh;Vl]x)
             self._runtime_u = torch.cat(parts_u, dim=1)
             self._runtime_v = torch.cat(parts_v, dim=0)
+            u_q = torch.cat(parts_u_q, dim=1)
+            v_q = torch.cat(parts_v_q, dim=0)
+            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_us = torch.cat(parts_u_s, dim=0)
+            self._runtime_vs = torch.cat(parts_v_s, dim=0)
         self._runtime_device = device
         self._runtime_dtype = dtype
 
@@ -936,8 +998,21 @@ class TwoPathLowRankLinear(nn.Module):
         dtype = x.dtype
         dev = x.device
         self._build_runtime_cache(dev, dtype)
-        if self._runtime_u is None or self._runtime_v is None or self._runtime_v.numel() == 0:
+        if (
+            self._runtime_u is None
+            or self._runtime_v is None
+            or self._runtime_uq_t is None
+            or self._runtime_vq_t is None
+            or self._runtime_us is None
+            or self._runtime_vs is None
+            or self._runtime_v.numel() == 0
+        ):
             out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
+        elif _can_use_int8_gemm(dev, self.use_int8_kernel):
+            x2d = x.reshape(-1, x.shape[-1]).contiguous()
+            z2d = _int8_linear_dynamic_act(x2d, self._runtime_vq_t, self._runtime_vs)
+            out2d = _int8_linear_dynamic_act(z2d, self._runtime_uq_t, self._runtime_us)
+            out = out2d.reshape(*x.shape[:-1], self.out_features).to(dtype=dtype)
         else:
             z = F.linear(x, self._runtime_v)
             out = F.linear(z, self._runtime_u)
@@ -957,14 +1032,20 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         low_idx: torch.Tensor,
         high_bit: int = 8,
         low_bit: int = 4,
+        use_int8_kernel: bool = True,
     ):
         super().__init__()
         self.high_bit = high_bit
         self.low_bit = low_bit
+        self.use_int8_kernel = use_int8_kernel
         self.out_features = u_basis.shape[0]
         self.in_features = v_basis.shape[1]
         self._runtime_u: Optional[torch.Tensor] = None
         self._runtime_v: Optional[torch.Tensor] = None
+        self._runtime_uq_t: Optional[torch.Tensor] = None
+        self._runtime_vq_t: Optional[torch.Tensor] = None
+        self._runtime_us: Optional[torch.Tensor] = None
+        self._runtime_vs: Optional[torch.Tensor] = None
         self._runtime_sigma: Optional[torch.Tensor] = None
         self._runtime_device: Optional[torch.device] = None
         self._runtime_dtype: Optional[torch.dtype] = None
@@ -1028,6 +1109,10 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         if (
             self._runtime_u is not None
             and self._runtime_v is not None
+            and self._runtime_uq_t is not None
+            and self._runtime_vq_t is not None
+            and self._runtime_us is not None
+            and self._runtime_vs is not None
             and self._runtime_sigma is not None
             and self._runtime_device == device
             and self._runtime_dtype == dtype
@@ -1036,25 +1121,53 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         parts_u = []
         parts_v = []
         parts_sigma = []
+        parts_u_q = []
+        parts_v_q = []
+        parts_u_s = []
+        parts_v_s = []
         if self.uh_q.numel() > 0:
             parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
             parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
             parts_sigma.append(self.sh.to(device=device, dtype=dtype))
+            parts_u_q.append(self.uh_q.to(device=device))
+            parts_v_q.append(self.vh_q.to(device=device))
+            parts_u_s.append(self.uh_s.to(device=device, dtype=torch.float32))
+            parts_v_s.append(self.vh_s.to(device=device, dtype=torch.float32))
         if self.ul_q.numel() > 0:
             parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
             parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
             parts_sigma.append(self.sl.to(device=device, dtype=dtype))
+            parts_u_q.append(self.ul_q.to(device=device))
+            parts_v_q.append(self.vl_q.to(device=device))
+            parts_u_s.append(self.ul_s.to(device=device, dtype=torch.float32))
+            parts_v_s.append(self.vl_s.to(device=device, dtype=torch.float32))
         if len(parts_u) == 0:
             self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
             self._runtime_v = torch.zeros((0, self.in_features), device=device, dtype=dtype)
+            self._runtime_uq_t = torch.zeros((0, self.out_features), device=device, dtype=torch.int8)
+            self._runtime_vq_t = torch.zeros((self.in_features, 0), device=device, dtype=torch.int8)
+            self._runtime_us = torch.zeros((self.out_features,), device=device, dtype=torch.float32)
+            self._runtime_vs = torch.zeros((0,), device=device, dtype=torch.float32)
             self._runtime_sigma = torch.zeros((0,), device=device, dtype=dtype)
         elif len(parts_u) == 1:
             self._runtime_u = parts_u[0]
             self._runtime_v = parts_v[0]
+            u_q = parts_u_q[0]
+            v_q = parts_v_q[0]
+            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_us = parts_u_s[0]
+            self._runtime_vs = parts_v_s[0]
             self._runtime_sigma = parts_sigma[0]
         else:
             self._runtime_u = torch.cat(parts_u, dim=1)
             self._runtime_v = torch.cat(parts_v, dim=0)
+            u_q = torch.cat(parts_u_q, dim=1)
+            v_q = torch.cat(parts_v_q, dim=0)
+            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_us = torch.cat(parts_u_s, dim=0)
+            self._runtime_vs = torch.cat(parts_v_s, dim=0)
             self._runtime_sigma = torch.cat(parts_sigma, dim=0)
         self._runtime_device = device
         self._runtime_dtype = dtype
@@ -1066,10 +1179,20 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         if (
             self._runtime_u is None
             or self._runtime_v is None
+            or self._runtime_uq_t is None
+            or self._runtime_vq_t is None
+            or self._runtime_us is None
+            or self._runtime_vs is None
             or self._runtime_sigma is None
             or self._runtime_v.numel() == 0
         ):
             out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
+        elif _can_use_int8_gemm(dev, self.use_int8_kernel):
+            x2d = x.reshape(-1, x.shape[-1]).contiguous()
+            z2d = _int8_linear_dynamic_act(x2d, self._runtime_vq_t, self._runtime_vs)
+            z2d = z2d * self._runtime_sigma.to(device=z2d.device, dtype=z2d.dtype).unsqueeze(0)
+            out2d = _int8_linear_dynamic_act(z2d, self._runtime_uq_t, self._runtime_us)
+            out = out2d.reshape(*x.shape[:-1], self.out_features).to(dtype=dtype)
         else:
             z = F.linear(x, self._runtime_v)
             z = z * self._runtime_sigma
@@ -1087,6 +1210,7 @@ def apply_two_path_quantization(
     low_bit: int = 4,
     explicit_sigma: bool = False,
     sigma_eps: float = 1e-12,
+    use_int8_kernel: bool = True,
 ):
     for pair in pairs:
         if pair.key not in alloc:
@@ -1113,6 +1237,7 @@ def apply_two_path_quantization(
                 low_idx=low_idx,
                 high_bit=high_bit,
                 low_bit=low_bit,
+                use_int8_kernel=use_int8_kernel,
             )
         else:
             mp = TwoPathLowRankLinear(
@@ -1123,6 +1248,50 @@ def apply_two_path_quantization(
                 low_idx=low_idx,
                 high_bit=high_bit,
                 low_bit=low_bit,
+                use_int8_kernel=use_int8_kernel,
             )
         parent = _get_submodule(model, pair.parent_path)
         setattr(parent, f"{pair.stem}_mp_proj", mp)
+
+
+@torch.no_grad()
+def strip_original_low_rank_weights(
+    model: nn.Module,
+    pairs: List[PairModules],
+) -> Dict[str, int]:
+    """
+    Strip original *_u_proj/*_v_proj modules after mp_proj is installed.
+    This reduces checkpoint size by removing redundant full-precision low-rank params.
+    """
+    removed_params = 0
+    replaced_modules = 0
+    skipped_pairs = 0
+
+    for pair in pairs:
+        parent = _get_submodule(model, pair.parent_path)
+        mp_name = f"{pair.stem}_mp_proj"
+        if not hasattr(parent, mp_name) or getattr(parent, mp_name) is None:
+            skipped_pairs += 1
+            continue
+
+        if hasattr(parent, pair.u_name):
+            u_mod = getattr(parent, pair.u_name)
+            if isinstance(u_mod, nn.Module) and not isinstance(u_mod, nn.Identity):
+                for param in u_mod.parameters(recurse=True):
+                    removed_params += int(param.numel())
+                setattr(parent, pair.u_name, nn.Identity())
+                replaced_modules += 1
+
+        if hasattr(parent, pair.v_name):
+            v_mod = getattr(parent, pair.v_name)
+            if isinstance(v_mod, nn.Module) and not isinstance(v_mod, nn.Identity):
+                for param in v_mod.parameters(recurse=True):
+                    removed_params += int(param.numel())
+                setattr(parent, pair.v_name, nn.Identity())
+                replaced_modules += 1
+
+    return {
+        "removed_params": removed_params,
+        "replaced_modules": replaced_modules,
+        "skipped_pairs": skipped_pairs,
+    }
