@@ -14,6 +14,7 @@ from utils.mixed_precision import (
     apply_two_path_quantization,
     build_pair_whiten_inv,
     calibrate_component_sigma,
+    clear_mixed_precision_runtime_cache,
     collect_kfac_stats_block_b,
     collect_kfac_stats_diagonal,
     collect_kfac_stats_sigma_full,
@@ -407,6 +408,18 @@ if __name__ == '__main__':
         help='Disable int8 GEMM kernel path in two-path quantized layers and force float fallback.'
     )
     parser.add_argument(
+        '--mp-enable-int4-kernel', action='store_true',
+        help='Enable native int4 kernel path (bitsandbytes Linear4bit) for 4-bit paths when available.'
+    )
+    parser.add_argument(
+        '--mp-int4-quant-type', type=str, default='nf4', choices=['nf4', 'fp4'],
+        help='Quant type for bitsandbytes 4-bit kernels.'
+    )
+    parser.add_argument(
+        '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
+        help='Checkpoint save format. auto -> state_dict when --mp-enable else full model object.'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -569,6 +582,8 @@ if __name__ == '__main__':
             explicit_sigma=args.mp_explicit_sigma,
             sigma_eps=args.mp_sigma_eps,
             use_int8_kernel=not args.mp_disable_int8_kernel,
+            use_int4_kernel=args.mp_enable_int4_kernel,
+            int4_quant_type=args.mp_int4_quant_type,
         )
         finish_stage("apply_quantization")
         mp_bar.close()
@@ -589,10 +604,35 @@ if __name__ == '__main__':
                 f"replaced_modules={strip_stats['replaced_modules']}, "
                 f"skipped_pairs={strip_stats['skipped_pairs']}"
             )
-        torch.save(
-            {
-                'model': model,
-                'tokenizer': tokenizer
-            },
-            args.save,
-        )
+        save_format = args.save_format
+        if save_format == "auto":
+            save_format = "state_dict" if args.mp_enable else "full"
+
+        if save_format == "state_dict":
+            cleared = clear_mixed_precision_runtime_cache(model)
+            payload = {
+                "format": "svd_mp_state_dict_v1",
+                "state_dict": model.state_dict(),
+                "tokenizer_path": args.tokenizer_path,
+                "base_model_path": getattr(getattr(model, "config", None), "_name_or_path", None),
+                "model_dtype": args.model_dtype,
+                "mp_config": {
+                    "enabled": bool(args.mp_enable),
+                    "explicit_sigma": bool(args.mp_explicit_sigma),
+                    "low_bit": int(args.mp_low_bit),
+                    "high_bit": int(args.mp_high_bit),
+                    "use_int8_kernel": bool(not args.mp_disable_int8_kernel),
+                    "use_int4_kernel": bool(args.mp_enable_int4_kernel),
+                    "int4_quant_type": args.mp_int4_quant_type,
+                },
+            }
+            torch.save(payload, args.save)
+            print(f"Saved minimal state_dict checkpoint ({cleared} runtime caches cleared) to {args.save}")
+        else:
+            torch.save(
+                {
+                    'model': model,
+                    'tokenizer': tokenizer
+                },
+                args.save,
+            )

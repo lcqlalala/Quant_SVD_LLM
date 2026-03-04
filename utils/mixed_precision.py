@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import bitsandbytes as bnb  # type: ignore[import-not-found]
+except Exception:
+    bnb = None
+
 
 @dataclass
 class PairModules:
@@ -826,6 +831,38 @@ def _can_use_int8_gemm(device: torch.device, use_int8_kernel: bool) -> bool:
     return bool(use_int8_kernel and device.type == "cuda" and hasattr(torch, "_int_mm"))
 
 
+def _can_use_int4_gemm(device: torch.device, use_int4_kernel: bool) -> bool:
+    return bool(use_int4_kernel and device.type == "cuda" and bnb is not None)
+
+
+def _make_bnb_linear4(
+    weight: torch.Tensor,
+    device: torch.device,
+    compute_dtype: torch.dtype = torch.float16,
+    quant_type: str = "nf4",
+) -> Optional[nn.Module]:
+    if bnb is None:
+        return None
+    linear4 = bnb.nn.Linear4bit(
+        weight.shape[1],
+        weight.shape[0],
+        bias=False,
+        compute_dtype=compute_dtype,
+        compress_statistics=True,
+        quant_type=quant_type,
+    )
+    linear4 = linear4.to(device)
+    w = weight.to(device=device, dtype=compute_dtype).contiguous()
+    linear4.weight = bnb.nn.Params4bit(
+        w,
+        requires_grad=False,
+        compress_statistics=True,
+        quant_type=quant_type,
+    )
+    linear4.eval()
+    return linear4
+
+
 def _quantize_activation_int8_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     x = x2d.float()
     scale = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
@@ -912,18 +949,35 @@ class TwoPathLowRankLinear(nn.Module):
         high_bit: int = 8,
         low_bit: int = 4,
         use_int8_kernel: bool = True,
+        use_int4_kernel: bool = False,
+        int4_quant_type: str = "nf4",
     ):
         super().__init__()
         self.high_bit = high_bit
         self.low_bit = low_bit
         self.use_int8_kernel = use_int8_kernel
+        self.use_int4_kernel = use_int4_kernel
+        self.int4_quant_type = int4_quant_type
         self.out_features = u_weight.shape[0]
+        self.in_features = v_weight.shape[1]
         self._runtime_u: Optional[torch.Tensor] = None
         self._runtime_v: Optional[torch.Tensor] = None
-        self._runtime_uq_t: Optional[torch.Tensor] = None
-        self._runtime_vq_t: Optional[torch.Tensor] = None
-        self._runtime_us: Optional[torch.Tensor] = None
-        self._runtime_vs: Optional[torch.Tensor] = None
+        self._runtime_uh: Optional[torch.Tensor] = None
+        self._runtime_vh: Optional[torch.Tensor] = None
+        self._runtime_ul: Optional[torch.Tensor] = None
+        self._runtime_vl: Optional[torch.Tensor] = None
+        self._runtime_uhq_t: Optional[torch.Tensor] = None
+        self._runtime_vhq_t: Optional[torch.Tensor] = None
+        self._runtime_uhs: Optional[torch.Tensor] = None
+        self._runtime_vhs: Optional[torch.Tensor] = None
+        self._runtime_ulq_t: Optional[torch.Tensor] = None
+        self._runtime_vlq_t: Optional[torch.Tensor] = None
+        self._runtime_uls: Optional[torch.Tensor] = None
+        self._runtime_vls: Optional[torch.Tensor] = None
+        self._runtime_vh4: Optional[nn.Module] = None
+        self._runtime_uh4: Optional[nn.Module] = None
+        self._runtime_vl4: Optional[nn.Module] = None
+        self._runtime_ul4: Optional[nn.Module] = None
         self._runtime_device: Optional[torch.device] = None
         self._runtime_dtype: Optional[torch.dtype] = None
         self.register_buffer("high_idx", high_idx.to(torch.long), persistent=False)
@@ -978,81 +1032,160 @@ class TwoPathLowRankLinear(nn.Module):
         if (
             self._runtime_u is not None
             and self._runtime_v is not None
-            and self._runtime_uq_t is not None
-            and self._runtime_vq_t is not None
-            and self._runtime_us is not None
-            and self._runtime_vs is not None
             and self._runtime_device == device
             and self._runtime_dtype == dtype
         ):
             return
+
+        self._runtime_uhq_t = None
+        self._runtime_vhq_t = None
+        self._runtime_uhs = None
+        self._runtime_vhs = None
+        self._runtime_uh = None
+        self._runtime_vh = None
+        self._runtime_ulq_t = None
+        self._runtime_vlq_t = None
+        self._runtime_uls = None
+        self._runtime_vls = None
+        self._runtime_ul = None
+        self._runtime_vl = None
+        self._runtime_vh4 = None
+        self._runtime_uh4 = None
+        self._runtime_vl4 = None
+        self._runtime_ul4 = None
+
         parts_u = []
         parts_v = []
-        parts_u_q = []
-        parts_v_q = []
-        parts_u_s = []
-        parts_v_s = []
         if self.uh_q.numel() > 0:
-            parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
-            parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
-            parts_u_q.append(self.uh_q.to(device=device))
-            parts_v_q.append(self.vh_q.to(device=device))
-            parts_u_s.append(self.uh_s.to(device=device, dtype=torch.float32))
-            parts_v_s.append(self.vh_s.to(device=device, dtype=torch.float32))
+            uh = self._deq_per_row(self.uh_q, self.uh_s, device, dtype)
+            vh = self._deq_per_row(self.vh_q, self.vh_s, device, dtype)
+            self._runtime_uh = uh
+            self._runtime_vh = vh
+            parts_u.append(uh)
+            parts_v.append(vh)
+            u_q = self.uh_q.to(device=device)
+            v_q = self.vh_q.to(device=device)
+            self._runtime_uhq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vhq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_uhs = self.uh_s.to(device=device, dtype=torch.float32)
+            self._runtime_vhs = self.vh_s.to(device=device, dtype=torch.float32)
+            if _can_use_int4_gemm(device, self.use_int4_kernel) and self.high_bit == 4:
+                self._runtime_vh4 = _make_bnb_linear4(
+                    vh.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
+                self._runtime_uh4 = _make_bnb_linear4(
+                    uh.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
         if self.ul_q.numel() > 0:
-            parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
-            parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
-            parts_u_q.append(self.ul_q.to(device=device))
-            parts_v_q.append(self.vl_q.to(device=device))
-            parts_u_s.append(self.ul_s.to(device=device, dtype=torch.float32))
-            parts_v_s.append(self.vl_s.to(device=device, dtype=torch.float32))
+            ul = self._deq_per_row(self.ul_q, self.ul_s, device, dtype)
+            vl = self._deq_per_row(self.vl_q, self.vl_s, device, dtype)
+            self._runtime_ul = ul
+            self._runtime_vl = vl
+            parts_u.append(ul)
+            parts_v.append(vl)
+            u_q = self.ul_q.to(device=device)
+            v_q = self.vl_q.to(device=device)
+            self._runtime_ulq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vlq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_uls = self.ul_s.to(device=device, dtype=torch.float32)
+            self._runtime_vls = self.vl_s.to(device=device, dtype=torch.float32)
+            if _can_use_int4_gemm(device, self.use_int4_kernel) and self.low_bit == 4:
+                self._runtime_vl4 = _make_bnb_linear4(
+                    vl.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
+                self._runtime_ul4 = _make_bnb_linear4(
+                    ul.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
         if len(parts_u) == 0:
             self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
-            self._runtime_v = torch.zeros((0, 0), device=device, dtype=dtype)
-            self._runtime_uq_t = torch.zeros((0, self.out_features), device=device, dtype=torch.int8)
-            self._runtime_vq_t = torch.zeros((0, 0), device=device, dtype=torch.int8)
-            self._runtime_us = torch.zeros((self.out_features,), device=device, dtype=torch.float32)
-            self._runtime_vs = torch.zeros((0,), device=device, dtype=torch.float32)
+            self._runtime_v = torch.zeros((0, self.in_features), device=device, dtype=dtype)
         elif len(parts_u) == 1:
             self._runtime_u = parts_u[0]
             self._runtime_v = parts_v[0]
-            u_q = parts_u_q[0]
-            v_q = parts_v_q[0]
-            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
-            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
-            self._runtime_us = parts_u_s[0]
-            self._runtime_vs = parts_v_s[0]
         else:
-            # Runtime fuse two paths into one low-rank chain: y = [Uh Ul]([Vh;Vl]x)
             self._runtime_u = torch.cat(parts_u, dim=1)
             self._runtime_v = torch.cat(parts_v, dim=0)
-            u_q = torch.cat(parts_u_q, dim=1)
-            v_q = torch.cat(parts_v_q, dim=0)
-            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
-            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
-            self._runtime_us = torch.cat(parts_u_s, dim=0)
-            self._runtime_vs = torch.cat(parts_v_s, dim=0)
         self._runtime_device = device
         self._runtime_dtype = dtype
+
+    def clear_runtime_cache(self):
+        self._runtime_u = None
+        self._runtime_v = None
+        self._runtime_uh = None
+        self._runtime_vh = None
+        self._runtime_ul = None
+        self._runtime_vl = None
+        self._runtime_uhq_t = None
+        self._runtime_vhq_t = None
+        self._runtime_uhs = None
+        self._runtime_vhs = None
+        self._runtime_ulq_t = None
+        self._runtime_vlq_t = None
+        self._runtime_uls = None
+        self._runtime_vls = None
+        self._runtime_vh4 = None
+        self._runtime_uh4 = None
+        self._runtime_vl4 = None
+        self._runtime_ul4 = None
+        self._runtime_device = None
+        self._runtime_dtype = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
         dev = x.device
         self._build_runtime_cache(dev, dtype)
-        if (
-            self._runtime_u is None
-            or self._runtime_v is None
-            or self._runtime_uq_t is None
-            or self._runtime_vq_t is None
-            or self._runtime_us is None
-            or self._runtime_vs is None
-            or self._runtime_v.numel() == 0
-        ):
+        if self._runtime_u is None or self._runtime_v is None or self._runtime_v.numel() == 0:
             out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
-        elif _can_use_int8_gemm(dev, self.use_int8_kernel):
+        elif _can_use_int8_gemm(dev, self.use_int8_kernel) or _can_use_int4_gemm(dev, self.use_int4_kernel):
             x2d = x.reshape(-1, x.shape[-1]).contiguous()
-            z2d = _int8_linear_dynamic_act(x2d, self._runtime_vq_t, self._runtime_vs)
-            out2d = _int8_linear_dynamic_act(z2d, self._runtime_uq_t, self._runtime_us)
+            out2d = torch.zeros((x2d.shape[0], self.out_features), device=dev, dtype=torch.float32)
+            x4 = x2d.to(dtype=torch.float16)
+            if self._runtime_vh is not None and self._runtime_uh is not None:
+                if self._runtime_vh4 is not None and self._runtime_uh4 is not None:
+                    zh = self._runtime_vh4(x4)
+                    out2d.add_(self._runtime_uh4(zh).to(dtype=torch.float32))
+                elif (
+                    _can_use_int8_gemm(dev, self.use_int8_kernel)
+                    and self._runtime_uhq_t is not None
+                    and self._runtime_vhq_t is not None
+                    and self._runtime_uhs is not None
+                    and self._runtime_vhs is not None
+                ):
+                    zh = _int8_linear_dynamic_act(x2d, self._runtime_vhq_t, self._runtime_vhs)
+                    out2d.add_(_int8_linear_dynamic_act(zh, self._runtime_uhq_t, self._runtime_uhs))
+                else:
+                    zh = F.linear(x2d.to(dtype=self._runtime_vh.dtype), self._runtime_vh)
+                    oh = F.linear(zh, self._runtime_uh)
+                    out2d.add_(oh.to(dtype=torch.float32))
+            if self._runtime_vl is not None and self._runtime_ul is not None:
+                if self._runtime_vl4 is not None and self._runtime_ul4 is not None:
+                    zl = self._runtime_vl4(x4)
+                    out2d.add_(self._runtime_ul4(zl).to(dtype=torch.float32))
+                elif (
+                    _can_use_int8_gemm(dev, self.use_int8_kernel)
+                    and self._runtime_ulq_t is not None
+                    and self._runtime_vlq_t is not None
+                    and self._runtime_uls is not None
+                    and self._runtime_vls is not None
+                ):
+                    zl = _int8_linear_dynamic_act(x2d, self._runtime_vlq_t, self._runtime_vls)
+                    out2d.add_(_int8_linear_dynamic_act(zl, self._runtime_ulq_t, self._runtime_uls))
+                else:
+                    zl = F.linear(x2d.to(dtype=self._runtime_vl.dtype), self._runtime_vl)
+                    ol = F.linear(zl, self._runtime_ul)
+                    out2d.add_(ol.to(dtype=torch.float32))
             out = out2d.reshape(*x.shape[:-1], self.out_features).to(dtype=dtype)
         else:
             z = F.linear(x, self._runtime_v)
@@ -1074,19 +1207,37 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         high_bit: int = 8,
         low_bit: int = 4,
         use_int8_kernel: bool = True,
+        use_int4_kernel: bool = False,
+        int4_quant_type: str = "nf4",
     ):
         super().__init__()
         self.high_bit = high_bit
         self.low_bit = low_bit
         self.use_int8_kernel = use_int8_kernel
+        self.use_int4_kernel = use_int4_kernel
+        self.int4_quant_type = int4_quant_type
         self.out_features = u_basis.shape[0]
         self.in_features = v_basis.shape[1]
         self._runtime_u: Optional[torch.Tensor] = None
         self._runtime_v: Optional[torch.Tensor] = None
-        self._runtime_uq_t: Optional[torch.Tensor] = None
-        self._runtime_vq_t: Optional[torch.Tensor] = None
-        self._runtime_us: Optional[torch.Tensor] = None
-        self._runtime_vs: Optional[torch.Tensor] = None
+        self._runtime_uh: Optional[torch.Tensor] = None
+        self._runtime_vh: Optional[torch.Tensor] = None
+        self._runtime_ul: Optional[torch.Tensor] = None
+        self._runtime_vl: Optional[torch.Tensor] = None
+        self._runtime_uhq_t: Optional[torch.Tensor] = None
+        self._runtime_vhq_t: Optional[torch.Tensor] = None
+        self._runtime_uhs: Optional[torch.Tensor] = None
+        self._runtime_vhs: Optional[torch.Tensor] = None
+        self._runtime_ulq_t: Optional[torch.Tensor] = None
+        self._runtime_vlq_t: Optional[torch.Tensor] = None
+        self._runtime_uls: Optional[torch.Tensor] = None
+        self._runtime_vls: Optional[torch.Tensor] = None
+        self._runtime_sh: Optional[torch.Tensor] = None
+        self._runtime_sl: Optional[torch.Tensor] = None
+        self._runtime_vh4: Optional[nn.Module] = None
+        self._runtime_uh4: Optional[nn.Module] = None
+        self._runtime_vl4: Optional[nn.Module] = None
+        self._runtime_ul4: Optional[nn.Module] = None
         self._runtime_sigma: Optional[torch.Tensor] = None
         self._runtime_device: Optional[torch.device] = None
         self._runtime_dtype: Optional[torch.dtype] = None
@@ -1150,68 +1301,129 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         if (
             self._runtime_u is not None
             and self._runtime_v is not None
-            and self._runtime_uq_t is not None
-            and self._runtime_vq_t is not None
-            and self._runtime_us is not None
-            and self._runtime_vs is not None
             and self._runtime_sigma is not None
             and self._runtime_device == device
             and self._runtime_dtype == dtype
         ):
             return
+
+        self._runtime_uhq_t = None
+        self._runtime_vhq_t = None
+        self._runtime_uhs = None
+        self._runtime_vhs = None
+        self._runtime_uh = None
+        self._runtime_vh = None
+        self._runtime_ulq_t = None
+        self._runtime_vlq_t = None
+        self._runtime_uls = None
+        self._runtime_vls = None
+        self._runtime_ul = None
+        self._runtime_vl = None
+        self._runtime_sh = None
+        self._runtime_sl = None
+        self._runtime_vh4 = None
+        self._runtime_uh4 = None
+        self._runtime_vl4 = None
+        self._runtime_ul4 = None
+
         parts_u = []
         parts_v = []
         parts_sigma = []
-        parts_u_q = []
-        parts_v_q = []
-        parts_u_s = []
-        parts_v_s = []
         if self.uh_q.numel() > 0:
-            parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
-            parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
+            uh = self._deq_per_row(self.uh_q, self.uh_s, device, dtype)
+            vh = self._deq_per_row(self.vh_q, self.vh_s, device, dtype)
+            self._runtime_uh = uh
+            self._runtime_vh = vh
+            parts_u.append(uh)
+            parts_v.append(vh)
             parts_sigma.append(self.sh.to(device=device, dtype=dtype))
-            parts_u_q.append(self.uh_q.to(device=device))
-            parts_v_q.append(self.vh_q.to(device=device))
-            parts_u_s.append(self.uh_s.to(device=device, dtype=torch.float32))
-            parts_v_s.append(self.vh_s.to(device=device, dtype=torch.float32))
+            u_q = self.uh_q.to(device=device)
+            v_q = self.vh_q.to(device=device)
+            self._runtime_uhq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vhq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_uhs = self.uh_s.to(device=device, dtype=torch.float32)
+            self._runtime_vhs = self.vh_s.to(device=device, dtype=torch.float32)
+            self._runtime_sh = self.sh.to(device=device, dtype=torch.float32)
+            if _can_use_int4_gemm(device, self.use_int4_kernel) and self.high_bit == 4:
+                self._runtime_vh4 = _make_bnb_linear4(
+                    vh.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
+                self._runtime_uh4 = _make_bnb_linear4(
+                    uh.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
         if self.ul_q.numel() > 0:
-            parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
-            parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
+            ul = self._deq_per_row(self.ul_q, self.ul_s, device, dtype)
+            vl = self._deq_per_row(self.vl_q, self.vl_s, device, dtype)
+            self._runtime_ul = ul
+            self._runtime_vl = vl
+            parts_u.append(ul)
+            parts_v.append(vl)
             parts_sigma.append(self.sl.to(device=device, dtype=dtype))
-            parts_u_q.append(self.ul_q.to(device=device))
-            parts_v_q.append(self.vl_q.to(device=device))
-            parts_u_s.append(self.ul_s.to(device=device, dtype=torch.float32))
-            parts_v_s.append(self.vl_s.to(device=device, dtype=torch.float32))
+            u_q = self.ul_q.to(device=device)
+            v_q = self.vl_q.to(device=device)
+            self._runtime_ulq_t = u_q.transpose(0, 1).contiguous()
+            self._runtime_vlq_t = v_q.transpose(0, 1).contiguous()
+            self._runtime_uls = self.ul_s.to(device=device, dtype=torch.float32)
+            self._runtime_vls = self.vl_s.to(device=device, dtype=torch.float32)
+            self._runtime_sl = self.sl.to(device=device, dtype=torch.float32)
+            if _can_use_int4_gemm(device, self.use_int4_kernel) and self.low_bit == 4:
+                self._runtime_vl4 = _make_bnb_linear4(
+                    vl.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
+                self._runtime_ul4 = _make_bnb_linear4(
+                    ul.float(),
+                    device=device,
+                    compute_dtype=torch.float16,
+                    quant_type=self.int4_quant_type,
+                )
         if len(parts_u) == 0:
             self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
             self._runtime_v = torch.zeros((0, self.in_features), device=device, dtype=dtype)
-            self._runtime_uq_t = torch.zeros((0, self.out_features), device=device, dtype=torch.int8)
-            self._runtime_vq_t = torch.zeros((self.in_features, 0), device=device, dtype=torch.int8)
-            self._runtime_us = torch.zeros((self.out_features,), device=device, dtype=torch.float32)
-            self._runtime_vs = torch.zeros((0,), device=device, dtype=torch.float32)
             self._runtime_sigma = torch.zeros((0,), device=device, dtype=dtype)
         elif len(parts_u) == 1:
             self._runtime_u = parts_u[0]
             self._runtime_v = parts_v[0]
-            u_q = parts_u_q[0]
-            v_q = parts_v_q[0]
-            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
-            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
-            self._runtime_us = parts_u_s[0]
-            self._runtime_vs = parts_v_s[0]
             self._runtime_sigma = parts_sigma[0]
         else:
             self._runtime_u = torch.cat(parts_u, dim=1)
             self._runtime_v = torch.cat(parts_v, dim=0)
-            u_q = torch.cat(parts_u_q, dim=1)
-            v_q = torch.cat(parts_v_q, dim=0)
-            self._runtime_uq_t = u_q.transpose(0, 1).contiguous()
-            self._runtime_vq_t = v_q.transpose(0, 1).contiguous()
-            self._runtime_us = torch.cat(parts_u_s, dim=0)
-            self._runtime_vs = torch.cat(parts_v_s, dim=0)
             self._runtime_sigma = torch.cat(parts_sigma, dim=0)
         self._runtime_device = device
         self._runtime_dtype = dtype
+
+    def clear_runtime_cache(self):
+        self._runtime_u = None
+        self._runtime_v = None
+        self._runtime_uh = None
+        self._runtime_vh = None
+        self._runtime_ul = None
+        self._runtime_vl = None
+        self._runtime_uhq_t = None
+        self._runtime_vhq_t = None
+        self._runtime_uhs = None
+        self._runtime_vhs = None
+        self._runtime_ulq_t = None
+        self._runtime_vlq_t = None
+        self._runtime_uls = None
+        self._runtime_vls = None
+        self._runtime_sh = None
+        self._runtime_sl = None
+        self._runtime_vh4 = None
+        self._runtime_uh4 = None
+        self._runtime_vl4 = None
+        self._runtime_ul4 = None
+        self._runtime_sigma = None
+        self._runtime_device = None
+        self._runtime_dtype = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
@@ -1220,19 +1432,60 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         if (
             self._runtime_u is None
             or self._runtime_v is None
-            or self._runtime_uq_t is None
-            or self._runtime_vq_t is None
-            or self._runtime_us is None
-            or self._runtime_vs is None
             or self._runtime_sigma is None
             or self._runtime_v.numel() == 0
         ):
             out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
-        elif _can_use_int8_gemm(dev, self.use_int8_kernel):
+        elif _can_use_int8_gemm(dev, self.use_int8_kernel) or _can_use_int4_gemm(dev, self.use_int4_kernel):
             x2d = x.reshape(-1, x.shape[-1]).contiguous()
-            z2d = _int8_linear_dynamic_act(x2d, self._runtime_vq_t, self._runtime_vs)
-            z2d = z2d * self._runtime_sigma.to(device=z2d.device, dtype=z2d.dtype).unsqueeze(0)
-            out2d = _int8_linear_dynamic_act(z2d, self._runtime_uq_t, self._runtime_us)
+            out2d = torch.zeros((x2d.shape[0], self.out_features), device=dev, dtype=torch.float32)
+            x4 = x2d.to(dtype=torch.float16)
+            if self._runtime_vh is not None and self._runtime_uh is not None:
+                if self._runtime_vh4 is not None and self._runtime_uh4 is not None:
+                    zh = self._runtime_vh4(x4)
+                    if self._runtime_sh is not None:
+                        zh = zh * self._runtime_sh.unsqueeze(0).to(device=zh.device, dtype=zh.dtype)
+                    out2d.add_(self._runtime_uh4(zh).to(dtype=torch.float32))
+                elif (
+                    _can_use_int8_gemm(dev, self.use_int8_kernel)
+                    and self._runtime_uhq_t is not None
+                    and self._runtime_vhq_t is not None
+                    and self._runtime_uhs is not None
+                    and self._runtime_vhs is not None
+                ):
+                    zh = _int8_linear_dynamic_act(x2d, self._runtime_vhq_t, self._runtime_vhs)
+                    if self._runtime_sh is not None:
+                        zh.mul_(self._runtime_sh.unsqueeze(0))
+                    out2d.add_(_int8_linear_dynamic_act(zh, self._runtime_uhq_t, self._runtime_uhs))
+                else:
+                    zh = F.linear(x2d.to(dtype=self._runtime_vh.dtype), self._runtime_vh)
+                    if self._runtime_sh is not None:
+                        zh = zh * self._runtime_sh.unsqueeze(0).to(device=zh.device, dtype=zh.dtype)
+                    oh = F.linear(zh, self._runtime_uh)
+                    out2d.add_(oh.to(dtype=torch.float32))
+            if self._runtime_vl is not None and self._runtime_ul is not None:
+                if self._runtime_vl4 is not None and self._runtime_ul4 is not None:
+                    zl = self._runtime_vl4(x4)
+                    if self._runtime_sl is not None:
+                        zl = zl * self._runtime_sl.unsqueeze(0).to(device=zl.device, dtype=zl.dtype)
+                    out2d.add_(self._runtime_ul4(zl).to(dtype=torch.float32))
+                elif (
+                    _can_use_int8_gemm(dev, self.use_int8_kernel)
+                    and self._runtime_ulq_t is not None
+                    and self._runtime_vlq_t is not None
+                    and self._runtime_uls is not None
+                    and self._runtime_vls is not None
+                ):
+                    zl = _int8_linear_dynamic_act(x2d, self._runtime_vlq_t, self._runtime_vls)
+                    if self._runtime_sl is not None:
+                        zl.mul_(self._runtime_sl.unsqueeze(0))
+                    out2d.add_(_int8_linear_dynamic_act(zl, self._runtime_ulq_t, self._runtime_uls))
+                else:
+                    zl = F.linear(x2d.to(dtype=self._runtime_vl.dtype), self._runtime_vl)
+                    if self._runtime_sl is not None:
+                        zl = zl * self._runtime_sl.unsqueeze(0).to(device=zl.device, dtype=zl.dtype)
+                    ol = F.linear(zl, self._runtime_ul)
+                    out2d.add_(ol.to(dtype=torch.float32))
             out = out2d.reshape(*x.shape[:-1], self.out_features).to(dtype=dtype)
         else:
             z = F.linear(x, self._runtime_v)
@@ -1252,7 +1505,11 @@ def apply_two_path_quantization(
     explicit_sigma: bool = False,
     sigma_eps: float = 1e-12,
     use_int8_kernel: bool = True,
+    use_int4_kernel: bool = False,
+    int4_quant_type: str = "nf4",
 ):
+    if use_int4_kernel and bnb is None:
+        print("Warning: --mp-enable-int4-kernel is set but bitsandbytes is not available. Falling back to non-int4 kernels.")
     for pair in pairs:
         if pair.key not in alloc:
             continue
@@ -1279,6 +1536,8 @@ def apply_two_path_quantization(
                 high_bit=high_bit,
                 low_bit=low_bit,
                 use_int8_kernel=use_int8_kernel,
+                use_int4_kernel=use_int4_kernel,
+                int4_quant_type=int4_quant_type,
             )
         else:
             mp = TwoPathLowRankLinear(
@@ -1290,9 +1549,26 @@ def apply_two_path_quantization(
                 high_bit=high_bit,
                 low_bit=low_bit,
                 use_int8_kernel=use_int8_kernel,
+                use_int4_kernel=use_int4_kernel,
+                int4_quant_type=int4_quant_type,
             )
         parent = _get_submodule(model, pair.parent_path)
         setattr(parent, f"{pair.stem}_mp_proj", mp)
+
+
+@torch.no_grad()
+def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
+    """
+    Clear transient runtime caches in MP quantized modules so saved checkpoints
+    only contain persistent quantized weights/buffers.
+    Returns the number of modules cleared.
+    """
+    cleared = 0
+    for mod in model.modules():
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear)):
+            mod.clear_runtime_cache()
+            cleared += 1
+    return cleared
 
 
 @torch.no_grad()
