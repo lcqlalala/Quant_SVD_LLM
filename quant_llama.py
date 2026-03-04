@@ -339,6 +339,10 @@ if __name__ == '__main__':
         help='KFAC approximation used for component importance.'
     )
     parser.add_argument(
+        '--mp-kfac-accum-device', type=str, default='cuda', choices=['cuda', 'cpu'],
+        help='Device used to accumulate K-FAC statistics matrices. cpu uses less GPU memory but is slower.'
+    )
+    parser.add_argument(
         '--mp-explicit-sigma', action='store_true',
         help='Use explicit W=U*diag(sigma)*V^T parameterization for sigma-space Fisher and MP quantization.'
     )
@@ -534,6 +538,7 @@ if __name__ == '__main__':
                 pairs=pairs,
                 dataloader=dataloader,
                 device=args.DEV,
+                accum_device=args.mp_kfac_accum_device,
                 nsamples=args.mp_kfac_nsamples,
                 whiten_inv=whiten_inv,
                 use_grad_checkpointing=args.mp_kfac_grad_checkpointing,

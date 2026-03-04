@@ -384,6 +384,7 @@ def collect_kfac_stats_sigma_full(
     pairs: List[PairModules],
     dataloader,
     device: str = "cuda",
+    accum_device: Optional[str] = None,
     nsamples: int = 8,
     whiten_inv: Optional[Dict[str, torch.Tensor]] = None,
     use_grad_checkpointing: bool = False,
@@ -399,28 +400,33 @@ def collect_kfac_stats_sigma_full(
     """
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
-    accum_device = torch.device(device)
-    explicit_meta: Dict[str, Dict[str, torch.Tensor]] = {}
+    compute_dev = torch.device(device)
+    stats_dev = torch.device(accum_device) if accum_device is not None else compute_dev
+    proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
     for pair in pairs:
         rank = pair.u_module.weight.shape[1]
         stats[pair.key] = {
-            "A_proj": torch.zeros((rank, rank), dtype=torch.float32, device=accum_device),
-            "G_proj": torch.zeros((rank, rank), dtype=torch.float32, device=accum_device),
+            "A_proj": torch.zeros((rank, rank), dtype=torch.float32, device=stats_dev),
+            "G_proj": torch.zeros((rank, rank), dtype=torch.float32, device=stats_dev),
             "count_a": 0.0,
             "count_g": 0.0,
         }
+        U_proj = pair.u_module.weight.detach().to(device=compute_dev)
+        V_proj = pair.v_module.weight.detach().to(device=compute_dev)
         if explicit_sigma:
             _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
-                u_weight=pair.u_module.weight.detach(),
-                v_weight=pair.v_module.weight.detach(),
+                u_weight=U_proj,
+                v_weight=V_proj,
                 eps=sigma_eps,
             )
-            explicit_meta[pair.key] = {
-                "active": active.to(device=accum_device, dtype=torch.float32),
-                "u_scale": u_scale.to(device=accum_device, dtype=torch.float32),
-                "v_scale": v_scale.to(device=accum_device, dtype=torch.float32),
-            }
+            active_mask_u = active.to(device=compute_dev, dtype=U_proj.dtype).unsqueeze(0)
+            active_mask_v = active.to(device=compute_dev, dtype=V_proj.dtype).unsqueeze(1)
+            u_scale = torch.where(active, u_scale, torch.ones_like(u_scale)).to(device=compute_dev, dtype=U_proj.dtype)
+            v_scale = torch.where(active, v_scale, torch.ones_like(v_scale)).to(device=compute_dev, dtype=V_proj.dtype)
+            U_proj = (U_proj / u_scale.unsqueeze(0)) * active_mask_u
+            V_proj = (V_proj / v_scale.unsqueeze(1)) * active_mask_v
+        proj_cache[pair.key] = {"U_proj": U_proj, "V_proj": V_proj}
 
         def mk_fwd_pre(k):
             def _hook(module, inputs):
@@ -428,15 +434,14 @@ def collect_kfac_stats_sigma_full(
                 x_flat = x.reshape(-1, x.shape[-1])
                 if whiten_inv is not None and k in whiten_inv:
                     x_flat = x_flat.matmul(whiten_inv[k].to(device=x_flat.device, dtype=x_flat.dtype))
-                # module is *_v_proj with shape [rank, in_dim]
-                V = module.weight.detach().float()
-                z = x_flat.matmul(V.transpose(0, 1))
-                if explicit_sigma and k in explicit_meta:
-                    v_scale = explicit_meta[k]["v_scale"].to(device=z.device, dtype=z.dtype)
-                    active = explicit_meta[k]["active"].to(device=z.device, dtype=z.dtype)
-                    z = z / v_scale.unsqueeze(0)
-                    z = z * active.unsqueeze(0)
-                stats[k]["A_proj"] += z.transpose(0, 1).matmul(z).to(dtype=torch.float32)
+                V_proj = proj_cache[k]["V_proj"]
+                x_proj = x_flat if x_flat.dtype == V_proj.dtype else x_flat.to(dtype=V_proj.dtype)
+                z = x_proj.matmul(V_proj.transpose(0, 1))
+                cov = z.transpose(0, 1).matmul(z).to(dtype=torch.float32)
+                if stats_dev.type == "cpu":
+                    stats[k]["A_proj"] += cov.cpu()
+                else:
+                    stats[k]["A_proj"] += cov.to(device=stats_dev)
                 stats[k]["count_a"] += float(z.shape[0])
 
             return _hook
@@ -445,15 +450,14 @@ def collect_kfac_stats_sigma_full(
             def _hook(module, grad_input, grad_output):
                 g = grad_output[0].detach().float()
                 g_flat = g.reshape(-1, g.shape[-1])
-                # module is *_u_proj with shape [out_dim, rank]
-                U = module.weight.detach().float()
-                s = g_flat.matmul(U)
-                if explicit_sigma and k in explicit_meta:
-                    u_scale = explicit_meta[k]["u_scale"].to(device=s.device, dtype=s.dtype)
-                    active = explicit_meta[k]["active"].to(device=s.device, dtype=s.dtype)
-                    s = s / u_scale.unsqueeze(0)
-                    s = s * active.unsqueeze(0)
-                stats[k]["G_proj"] += s.transpose(0, 1).matmul(s).to(dtype=torch.float32)
+                U_proj = proj_cache[k]["U_proj"]
+                g_proj = g_flat if g_flat.dtype == U_proj.dtype else g_flat.to(dtype=U_proj.dtype)
+                s = g_proj.matmul(U_proj)
+                cov = s.transpose(0, 1).matmul(s).to(dtype=torch.float32)
+                if stats_dev.type == "cpu":
+                    stats[k]["G_proj"] += cov.cpu()
+                else:
+                    stats[k]["G_proj"] += cov.to(device=stats_dev)
                 stats[k]["count_g"] += float(s.shape[0])
 
             return _hook
