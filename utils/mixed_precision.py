@@ -402,7 +402,6 @@ def collect_kfac_stats_sigma_full(
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
     compute_dev = torch.device(device)
     stats_dev = torch.device(accum_device) if accum_device is not None else compute_dev
-    proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
     for pair in pairs:
         rank = pair.u_module.weight.shape[1]
@@ -412,67 +411,89 @@ def collect_kfac_stats_sigma_full(
             "count_a": 0.0,
             "count_g": 0.0,
         }
-        U_proj = pair.u_module.weight.detach().to(device=compute_dev)
-        V_proj = pair.v_module.weight.detach().to(device=compute_dev)
-        if explicit_sigma:
-            _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
-                u_weight=U_proj,
-                v_weight=V_proj,
-                eps=sigma_eps,
-            )
-            active_mask_u = active.to(device=compute_dev, dtype=U_proj.dtype).unsqueeze(0)
-            active_mask_v = active.to(device=compute_dev, dtype=V_proj.dtype).unsqueeze(1)
-            u_scale = torch.where(active, u_scale, torch.ones_like(u_scale)).to(device=compute_dev, dtype=U_proj.dtype)
-            v_scale = torch.where(active, v_scale, torch.ones_like(v_scale)).to(device=compute_dev, dtype=V_proj.dtype)
-            U_proj = (U_proj / u_scale.unsqueeze(0)) * active_mask_u
-            V_proj = (V_proj / v_scale.unsqueeze(1)) * active_mask_v
-        proj_cache[pair.key] = {"U_proj": U_proj, "V_proj": V_proj}
 
-        def mk_fwd_pre(k):
-            def _hook(module, inputs):
-                x = inputs[0].detach().float()
-                x_flat = x.reshape(-1, x.shape[-1])
-                if whiten_inv is not None and k in whiten_inv:
-                    x_flat = x_flat.matmul(whiten_inv[k].to(device=x_flat.device, dtype=x_flat.dtype))
-                V_proj = proj_cache[k]["V_proj"]
-                x_proj = x_flat if x_flat.dtype == V_proj.dtype else x_flat.to(dtype=V_proj.dtype)
-                z = x_proj.matmul(V_proj.transpose(0, 1))
-                cov = z.transpose(0, 1).matmul(z).to(dtype=torch.float32)
-                if stats_dev.type == "cpu":
-                    stats[k]["A_proj"] += cov.cpu()
-                else:
-                    stats[k]["A_proj"] += cov.to(device=stats_dev)
-                stats[k]["count_a"] += float(z.shape[0])
+    def mk_fwd_pre(k: str, subset_proj_cache: Dict[str, Dict[str, torch.Tensor]]):
+        def _hook(module, inputs):
+            x = inputs[0].detach().float()
+            x_flat = x.reshape(-1, x.shape[-1])
+            if "W_inv" in subset_proj_cache[k]:
+                x_flat = x_flat.matmul(subset_proj_cache[k]["W_inv"])
+            V_proj = subset_proj_cache[k]["V_proj"]
+            x_proj = x_flat if x_flat.dtype == V_proj.dtype else x_flat.to(dtype=V_proj.dtype)
+            z = x_proj.matmul(V_proj.transpose(0, 1))
+            cov = z.transpose(0, 1).matmul(z).to(dtype=torch.float32)
+            if stats_dev.type == "cpu":
+                stats[k]["A_proj"] += cov.cpu()
+            else:
+                stats[k]["A_proj"] += cov.to(device=stats_dev)
+            stats[k]["count_a"] += float(z.shape[0])
 
-            return _hook
+        return _hook
 
-        def mk_bwd(k):
-            def _hook(module, grad_input, grad_output):
-                g = grad_output[0].detach().float()
-                g_flat = g.reshape(-1, g.shape[-1])
-                U_proj = proj_cache[k]["U_proj"]
-                g_proj = g_flat if g_flat.dtype == U_proj.dtype else g_flat.to(dtype=U_proj.dtype)
-                s = g_proj.matmul(U_proj)
-                cov = s.transpose(0, 1).matmul(s).to(dtype=torch.float32)
-                if stats_dev.type == "cpu":
-                    stats[k]["G_proj"] += cov.cpu()
-                else:
-                    stats[k]["G_proj"] += cov.to(device=stats_dev)
-                stats[k]["count_g"] += float(s.shape[0])
+    def mk_bwd(k: str, subset_proj_cache: Dict[str, Dict[str, torch.Tensor]]):
+        def _hook(module, grad_input, grad_output):
+            g = grad_output[0].detach().float()
+            g_flat = g.reshape(-1, g.shape[-1])
+            U_proj = subset_proj_cache[k]["U_proj"]
+            g_proj = g_flat if g_flat.dtype == U_proj.dtype else g_flat.to(dtype=U_proj.dtype)
+            s = g_proj.matmul(U_proj)
+            cov = s.transpose(0, 1).matmul(s).to(dtype=torch.float32)
+            if stats_dev.type == "cpu":
+                stats[k]["G_proj"] += cov.cpu()
+            else:
+                stats[k]["G_proj"] += cov.to(device=stats_dev)
+            stats[k]["count_g"] += float(s.shape[0])
 
-            return _hook
+        return _hook
 
-    pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
-    for subset in pair_subsets:
-        handles = []
-        for pair in subset:
-            handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
-            handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
-
+    cached_batches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+    if layerwise:
+        cached_batches = []
         for idx, batch in enumerate(dataloader):
             if idx >= nsamples:
                 break
-            input_ids, labels = batch[0].to(device), batch[1].to(device)
+            cached_batches.append((batch[0].detach().cpu(), batch[1].detach().cpu()))
+
+    pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
+    for subset in pair_subsets:
+        subset_proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
+        for pair in subset:
+            U_proj = pair.u_module.weight.detach().to(device=compute_dev)
+            V_proj = pair.v_module.weight.detach().to(device=compute_dev)
+            if explicit_sigma:
+                _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
+                    u_weight=U_proj,
+                    v_weight=V_proj,
+                    eps=sigma_eps,
+                )
+                active_mask_u = active.to(device=compute_dev, dtype=U_proj.dtype).unsqueeze(0)
+                active_mask_v = active.to(device=compute_dev, dtype=V_proj.dtype).unsqueeze(1)
+                u_scale = torch.where(active, u_scale, torch.ones_like(u_scale)).to(device=compute_dev, dtype=U_proj.dtype)
+                v_scale = torch.where(active, v_scale, torch.ones_like(v_scale)).to(device=compute_dev, dtype=V_proj.dtype)
+                U_proj = (U_proj / u_scale.unsqueeze(0)) * active_mask_u
+                V_proj = (V_proj / v_scale.unsqueeze(1)) * active_mask_v
+            entry: Dict[str, torch.Tensor] = {"U_proj": U_proj, "V_proj": V_proj}
+            if whiten_inv is not None and pair.key in whiten_inv:
+                entry["W_inv"] = whiten_inv[pair.key].to(device=compute_dev, dtype=torch.float32)
+            subset_proj_cache[pair.key] = entry
+
+        handles = []
+        for pair in subset:
+            handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key, subset_proj_cache)))
+            handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key, subset_proj_cache)))
+
+        if cached_batches is not None:
+            run_batches = cached_batches
+        else:
+            run_batches = []
+            for idx, batch in enumerate(dataloader):
+                if idx >= nsamples:
+                    break
+                run_batches.append((batch[0], batch[1]))
+
+        for input_ids, labels in run_batches:
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
             model.zero_grad(set_to_none=True)
             out = model(input_ids=input_ids, labels=labels, use_cache=False)
             out.loss.backward()
@@ -480,6 +501,7 @@ def collect_kfac_stats_sigma_full(
         for h in handles:
             h.remove()
         model.zero_grad(set_to_none=True)
+        subset_proj_cache.clear()
 
     for key, v in stats.items():
         ca = max(float(v["count_a"]), 1.0)
