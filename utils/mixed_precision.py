@@ -851,16 +851,32 @@ def _make_bnb_linear4(
         compress_statistics=True,
         quant_type=quant_type,
     )
-    linear4 = linear4.to(device)
-    w = weight.to(device=device, dtype=compute_dtype).contiguous()
+    # Build Params4bit on CPU first, then move module to CUDA to initialize quant_state.
+    w = weight.to(device="cpu", dtype=compute_dtype).contiguous()
     linear4.weight = bnb.nn.Params4bit(
         w,
         requires_grad=False,
         compress_statistics=True,
         quant_type=quant_type,
     )
+    linear4 = linear4.to(device)
     linear4.eval()
     return linear4
+
+
+def _run_bnb_linear4(linear4: Optional[nn.Module], x: torch.Tensor) -> Optional[torch.Tensor]:
+    if linear4 is None:
+        return None
+    try:
+        return linear4(x)
+    except AssertionError:
+        # bitsandbytes may miss quant_state when module/device state changes unexpectedly.
+        # Retry after refreshing device placement; return None on persistent failure.
+        try:
+            linear4.to(x.device)
+            return linear4(x)
+        except Exception:
+            return None
 
 
 def _quantize_activation_int8_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1154,8 +1170,13 @@ class TwoPathLowRankLinear(nn.Module):
             x4 = x2d.to(dtype=torch.float16)
             if self._runtime_vh is not None and self._runtime_uh is not None:
                 if self._runtime_vh4 is not None and self._runtime_uh4 is not None:
-                    zh = self._runtime_vh4(x4)
-                    out2d.add_(self._runtime_uh4(zh).to(dtype=torch.float32))
+                    zh = _run_bnb_linear4(self._runtime_vh4, x4)
+                    oh = _run_bnb_linear4(self._runtime_uh4, zh) if zh is not None else None
+                    if oh is not None:
+                        out2d.add_(oh.to(dtype=torch.float32))
+                    else:
+                        self._runtime_vh4 = None
+                        self._runtime_uh4 = None
                 elif (
                     _can_use_int8_gemm(dev, self.use_int8_kernel)
                     and self._runtime_uhq_t is not None
@@ -1171,8 +1192,13 @@ class TwoPathLowRankLinear(nn.Module):
                     out2d.add_(oh.to(dtype=torch.float32))
             if self._runtime_vl is not None and self._runtime_ul is not None:
                 if self._runtime_vl4 is not None and self._runtime_ul4 is not None:
-                    zl = self._runtime_vl4(x4)
-                    out2d.add_(self._runtime_ul4(zl).to(dtype=torch.float32))
+                    zl = _run_bnb_linear4(self._runtime_vl4, x4)
+                    ol = _run_bnb_linear4(self._runtime_ul4, zl) if zl is not None else None
+                    if ol is not None:
+                        out2d.add_(ol.to(dtype=torch.float32))
+                    else:
+                        self._runtime_vl4 = None
+                        self._runtime_ul4 = None
                 elif (
                     _can_use_int8_gemm(dev, self.use_int8_kernel)
                     and self._runtime_ulq_t is not None
@@ -1442,10 +1468,18 @@ class TwoPathSigmaLowRankLinear(nn.Module):
             x4 = x2d.to(dtype=torch.float16)
             if self._runtime_vh is not None and self._runtime_uh is not None:
                 if self._runtime_vh4 is not None and self._runtime_uh4 is not None:
-                    zh = self._runtime_vh4(x4)
-                    if self._runtime_sh is not None:
-                        zh = zh * self._runtime_sh.unsqueeze(0).to(device=zh.device, dtype=zh.dtype)
-                    out2d.add_(self._runtime_uh4(zh).to(dtype=torch.float32))
+                    zh = _run_bnb_linear4(self._runtime_vh4, x4)
+                    if zh is not None:
+                        if self._runtime_sh is not None:
+                            zh = zh * self._runtime_sh.unsqueeze(0).to(device=zh.device, dtype=zh.dtype)
+                        oh = _run_bnb_linear4(self._runtime_uh4, zh)
+                    else:
+                        oh = None
+                    if oh is not None:
+                        out2d.add_(oh.to(dtype=torch.float32))
+                    else:
+                        self._runtime_vh4 = None
+                        self._runtime_uh4 = None
                 elif (
                     _can_use_int8_gemm(dev, self.use_int8_kernel)
                     and self._runtime_uhq_t is not None
@@ -1465,10 +1499,18 @@ class TwoPathSigmaLowRankLinear(nn.Module):
                     out2d.add_(oh.to(dtype=torch.float32))
             if self._runtime_vl is not None and self._runtime_ul is not None:
                 if self._runtime_vl4 is not None and self._runtime_ul4 is not None:
-                    zl = self._runtime_vl4(x4)
-                    if self._runtime_sl is not None:
-                        zl = zl * self._runtime_sl.unsqueeze(0).to(device=zl.device, dtype=zl.dtype)
-                    out2d.add_(self._runtime_ul4(zl).to(dtype=torch.float32))
+                    zl = _run_bnb_linear4(self._runtime_vl4, x4)
+                    if zl is not None:
+                        if self._runtime_sl is not None:
+                            zl = zl * self._runtime_sl.unsqueeze(0).to(device=zl.device, dtype=zl.dtype)
+                        ol = _run_bnb_linear4(self._runtime_ul4, zl)
+                    else:
+                        ol = None
+                    if ol is not None:
+                        out2d.add_(ol.to(dtype=torch.float32))
+                    else:
+                        self._runtime_vl4 = None
+                        self._runtime_ul4 = None
                 elif (
                     _can_use_int8_gemm(dev, self.use_int8_kernel)
                     and self._runtime_ulq_t is not None
