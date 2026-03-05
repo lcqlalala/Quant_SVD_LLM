@@ -449,6 +449,21 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    def resolve_save_path(save_arg: str) -> str:
+        if save_arg is None or len(save_arg.strip()) == 0:
+            return save_arg
+        save_arg = save_arg.strip()
+        is_dir_like = save_arg.endswith(os.sep) or os.path.isdir(save_arg)
+        if is_dir_like:
+            os.makedirs(save_arg, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            fname = f"svd_mp_ckpt_{stamp}.pt"
+            return os.path.join(save_arg, fname)
+        parent = os.path.dirname(save_arg)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return save_arg
+
     model, tokenizer = get_model_from_local(args.model_path, tokenizer_path=args.tokenizer_path)
     if args.model_dtype == "fp16":
         model = model.half()
@@ -613,6 +628,9 @@ if __name__ == '__main__':
     #     llama_pack3(model, quantizers)
     #     torch.save(model.state_dict(), args.save)
     if args.save:
+        save_path = resolve_save_path(args.save)
+        if save_path != args.save:
+            print(f"--save points to a directory; resolved checkpoint file: {save_path}")
         if args.mp_enable and pairs is not None:
             strip_stats = strip_original_low_rank_weights(model=model, pairs=pairs)
             print(
@@ -643,16 +661,17 @@ if __name__ == '__main__':
                     "int4_quant_type": args.mp_int4_quant_type,
                 },
             }
-            torch.save(payload, args.save)
-            print(f"Saved minimal state_dict checkpoint ({cleared} runtime caches cleared) to {args.save}")
+            torch.save(payload, save_path)
+            print(f"Saved minimal state_dict checkpoint ({cleared} runtime caches cleared) to {save_path}")
         else:
             torch.save(
                 {
                     'model': model,
                     'tokenizer': tokenizer
                 },
-                args.save,
+                save_path,
             )
+            print(f"Saved full checkpoint to {save_path}")
 
         # Evaluate from reloaded checkpoint to avoid carrying quantization-stage memory/cache.
         print("Reloading saved checkpoint before evaluation to reduce peak memory...")
@@ -660,7 +679,7 @@ if __name__ == '__main__':
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        model, tokenizer = get_model_from_local(args.save, tokenizer_path=args.tokenizer_path)
+        model, tokenizer = get_model_from_local(save_path, tokenizer_path=args.tokenizer_path)
         if args.model_dtype == "fp16":
             model = model.half()
         elif args.model_dtype == "bf16":
