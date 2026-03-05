@@ -915,6 +915,70 @@ def _int8_linear_dynamic_act(
         return x2d.to(dtype=torch.float32).matmul(w)
 
 
+def _pad_int8_chain_rank(
+    v_q_t: torch.Tensor,
+    v_s: torch.Tensor,
+    u_q_t: torch.Tensor,
+    sigma: Optional[torch.Tensor] = None,
+    multiple: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Pad rank dimension so torch._int_mm shape constraints are satisfied.
+    v_q_t: [in_features, rank]
+    v_s:   [rank]
+    u_q_t: [rank, out_features]
+    sigma: [rank] (optional, for explicit-sigma path)
+    """
+    if multiple <= 1:
+        return v_q_t, v_s, u_q_t, sigma
+    rank = int(v_q_t.shape[1])
+    if rank == 0 or rank % multiple == 0:
+        return v_q_t, v_s, u_q_t, sigma
+
+    pad = multiple - (rank % multiple)
+    v_pad = torch.zeros((v_q_t.shape[0], pad), device=v_q_t.device, dtype=v_q_t.dtype)
+    u_pad = torch.zeros((pad, u_q_t.shape[1]), device=u_q_t.device, dtype=u_q_t.dtype)
+    # Any positive finite scale is fine for zero quantized weights.
+    s_pad = torch.ones((pad,), device=v_s.device, dtype=v_s.dtype)
+
+    v_q_t = torch.cat([v_q_t, v_pad], dim=1)
+    v_s = torch.cat([v_s, s_pad], dim=0)
+    u_q_t = torch.cat([u_q_t, u_pad], dim=0)
+
+    if sigma is not None:
+        sigma_pad = torch.zeros((pad,), device=sigma.device, dtype=sigma.dtype)
+        sigma = torch.cat([sigma, sigma_pad], dim=0)
+
+    return v_q_t, v_s, u_q_t, sigma
+
+
+def _pad_dense_chain_rank(
+    v: torch.Tensor,
+    u: torch.Tensor,
+    sigma: Optional[torch.Tensor] = None,
+    multiple: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Pad dense low-rank chain (V, U, [sigma]) along rank dimension.
+    v: [rank, in_features], u: [out_features, rank], sigma: [rank] (optional)
+    """
+    if multiple <= 1:
+        return v, u, sigma
+    rank = int(v.shape[0])
+    if rank == 0 or rank % multiple == 0:
+        return v, u, sigma
+
+    pad = multiple - (rank % multiple)
+    v_pad = torch.zeros((pad, v.shape[1]), device=v.device, dtype=v.dtype)
+    u_pad = torch.zeros((u.shape[0], pad), device=u.device, dtype=u.dtype)
+    v = torch.cat([v, v_pad], dim=0)
+    u = torch.cat([u, u_pad], dim=1)
+    if sigma is not None:
+        sigma_pad = torch.zeros((pad,), device=sigma.device, dtype=sigma.dtype)
+        sigma = torch.cat([sigma, sigma_pad], dim=0)
+    return v, u, sigma
+
+
 def _rank1_outer_error(u: torch.Tensor, v: torch.Tensor, uq: torch.Tensor, vq: torch.Tensor) -> torch.Tensor:
     uu = torch.dot(u, u)
     vv = torch.dot(v, v)
@@ -1101,15 +1165,23 @@ class TwoPathLowRankLinear(nn.Module):
             self._runtime_vhq_t = v_q.transpose(0, 1).contiguous()
             self._runtime_uhs = self.uh_s.to(device=device, dtype=torch.float32)
             self._runtime_vhs = self.vh_s.to(device=device, dtype=torch.float32)
+            self._runtime_vhq_t, self._runtime_vhs, self._runtime_uhq_t, _ = _pad_int8_chain_rank(
+                self._runtime_vhq_t,
+                self._runtime_vhs,
+                self._runtime_uhq_t,
+                sigma=None,
+                multiple=8,
+            )
             if _can_use_int4_gemm(device, self.use_int4_kernel) and self.high_bit == 4:
+                vh_i4, uh_i4, _ = _pad_dense_chain_rank(vh.float(), uh.float(), sigma=None, multiple=8)
                 self._runtime_vh4 = _make_bnb_linear4(
-                    vh.float(),
+                    vh_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
                 self._runtime_uh4 = _make_bnb_linear4(
-                    uh.float(),
+                    uh_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
@@ -1127,15 +1199,23 @@ class TwoPathLowRankLinear(nn.Module):
             self._runtime_vlq_t = v_q.transpose(0, 1).contiguous()
             self._runtime_uls = self.ul_s.to(device=device, dtype=torch.float32)
             self._runtime_vls = self.vl_s.to(device=device, dtype=torch.float32)
+            self._runtime_vlq_t, self._runtime_vls, self._runtime_ulq_t, _ = _pad_int8_chain_rank(
+                self._runtime_vlq_t,
+                self._runtime_vls,
+                self._runtime_ulq_t,
+                sigma=None,
+                multiple=8,
+            )
             if _can_use_int4_gemm(device, self.use_int4_kernel) and self.low_bit == 4:
+                vl_i4, ul_i4, _ = _pad_dense_chain_rank(vl.float(), ul.float(), sigma=None, multiple=8)
                 self._runtime_vl4 = _make_bnb_linear4(
-                    vl.float(),
+                    vl_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
                 self._runtime_ul4 = _make_bnb_linear4(
-                    ul.float(),
+                    ul_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
@@ -1386,19 +1466,34 @@ class TwoPathSigmaLowRankLinear(nn.Module):
             self._runtime_uhs = self.uh_s.to(device=device, dtype=torch.float32)
             self._runtime_vhs = self.vh_s.to(device=device, dtype=torch.float32)
             self._runtime_sh = self.sh.to(device=device, dtype=torch.float32)
+            self._runtime_vhq_t, self._runtime_vhs, self._runtime_uhq_t, self._runtime_sh = _pad_int8_chain_rank(
+                self._runtime_vhq_t,
+                self._runtime_vhs,
+                self._runtime_uhq_t,
+                sigma=self._runtime_sh,
+                multiple=8,
+            )
             if _can_use_int4_gemm(device, self.use_int4_kernel) and self.high_bit == 4:
-                self._runtime_vh4 = _make_bnb_linear4(
+                vh_i4, uh_i4, sh_i4 = _pad_dense_chain_rank(
                     vh.float(),
+                    uh.float(),
+                    sigma=self.sh.to(device=device, dtype=torch.float32),
+                    multiple=8,
+                )
+                self._runtime_vh4 = _make_bnb_linear4(
+                    vh_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
                 self._runtime_uh4 = _make_bnb_linear4(
-                    uh.float(),
+                    uh_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
+                if sh_i4 is not None:
+                    self._runtime_sh = sh_i4
         if self.ul_q.numel() > 0:
             ul = self._deq_per_row(self.ul_q, self.ul_s, device, dtype)
             vl = self._deq_per_row(self.vl_q, self.vl_s, device, dtype)
@@ -1414,19 +1509,34 @@ class TwoPathSigmaLowRankLinear(nn.Module):
             self._runtime_uls = self.ul_s.to(device=device, dtype=torch.float32)
             self._runtime_vls = self.vl_s.to(device=device, dtype=torch.float32)
             self._runtime_sl = self.sl.to(device=device, dtype=torch.float32)
+            self._runtime_vlq_t, self._runtime_vls, self._runtime_ulq_t, self._runtime_sl = _pad_int8_chain_rank(
+                self._runtime_vlq_t,
+                self._runtime_vls,
+                self._runtime_ulq_t,
+                sigma=self._runtime_sl,
+                multiple=8,
+            )
             if _can_use_int4_gemm(device, self.use_int4_kernel) and self.low_bit == 4:
-                self._runtime_vl4 = _make_bnb_linear4(
+                vl_i4, ul_i4, sl_i4 = _pad_dense_chain_rank(
                     vl.float(),
+                    ul.float(),
+                    sigma=self.sl.to(device=device, dtype=torch.float32),
+                    multiple=8,
+                )
+                self._runtime_vl4 = _make_bnb_linear4(
+                    vl_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
                 self._runtime_ul4 = _make_bnb_linear4(
-                    ul.float(),
+                    ul_i4,
                     device=device,
                     compute_dtype=torch.float16,
                     quant_type=self.int4_quant_type,
                 )
+                if sl_i4 is not None:
+                    self._runtime_sl = sl_i4
         if len(parts_u) == 0:
             self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
             self._runtime_v = torch.zeros((0, self.in_features), device=device, dtype=dtype)
