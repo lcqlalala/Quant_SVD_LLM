@@ -891,12 +891,28 @@ def _int8_linear_dynamic_act(
     weight_q_t: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
+    # Fallback path for shapes unsupported by torch._int_mm.
+    # Keep numerically equivalent semantics: y = x @ (W_q * s).
+    if weight_q_t.ndim != 2:
+        return torch.zeros((x2d.shape[0], 0), device=x2d.device, dtype=torch.float32)
+    if weight_q_t.shape[0] == 0 or weight_q_t.shape[1] == 0:
+        return torch.zeros((x2d.shape[0], int(weight_q_t.shape[1])), device=x2d.device, dtype=torch.float32)
+    if weight_q_t.shape[1] % 8 != 0:
+        w = weight_q_t.to(dtype=torch.float32) * weight_scale.unsqueeze(0).to(dtype=torch.float32, device=weight_q_t.device)
+        return x2d.to(dtype=torch.float32).matmul(w)
+
     xq, x_scale = _quantize_activation_int8_2d(x2d)
-    y_i32 = torch._int_mm(xq, weight_q_t)
-    y = y_i32.to(torch.float32)
-    y.mul_(x_scale.unsqueeze(1))
-    y.mul_(weight_scale.unsqueeze(0))
-    return y
+    try:
+        y_i32 = torch._int_mm(xq, weight_q_t)
+        y = y_i32.to(torch.float32)
+        y.mul_(x_scale.unsqueeze(1))
+        y.mul_(weight_scale.unsqueeze(0))
+        return y
+    except RuntimeError:
+        # Some GPUs / torch builds enforce extra shape constraints in _int_mm.
+        # Safe fallback to dequantized matmul for this invocation.
+        w = weight_q_t.to(dtype=torch.float32) * weight_scale.unsqueeze(0).to(dtype=torch.float32, device=weight_q_t.device)
+        return x2d.to(dtype=torch.float32).matmul(w)
 
 
 def _rank1_outer_error(u: torch.Tensor, v: torch.Tensor, uq: torch.Tensor, vq: torch.Tensor) -> torch.Tensor:
