@@ -880,10 +880,24 @@ def _run_bnb_linear4(linear4: Optional[nn.Module], x: torch.Tensor) -> Optional[
 
 
 def _quantize_activation_int8_2d(x2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    x = x2d.float()
-    scale = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
-    xq = torch.round(x / scale).clamp(-127, 127).to(torch.int8).contiguous()
-    return xq, scale.squeeze(1).to(torch.float32)
+    # Chunked quantization to limit temporary memory spikes on long sequences / large batches.
+    rows = x2d.shape[0]
+    if rows == 0:
+        return torch.empty_like(x2d, dtype=torch.int8), torch.empty((0,), device=x2d.device, dtype=torch.float32)
+    chunk_rows = 4096
+    xq = torch.empty_like(x2d, dtype=torch.int8)
+    scales = torch.empty((rows,), device=x2d.device, dtype=torch.float32)
+    for s in range(0, rows, chunk_rows):
+        e = min(s + chunk_rows, rows)
+        xb = x2d[s:e]
+        xmax = torch.amax(xb, dim=1)
+        xmin = torch.amin(xb, dim=1)
+        absmax = torch.maximum(xmax, -xmin).to(torch.float32).clamp_min_(1e-8)
+        sc = absmax / 127.0
+        q = torch.round(xb.to(torch.float32) / sc.unsqueeze(1)).clamp(-127, 127).to(torch.int8)
+        xq[s:e] = q
+        scales[s:e] = sc
+    return xq.contiguous(), scales
 
 
 def _int8_linear_dynamic_act(
@@ -1054,6 +1068,7 @@ class TwoPathLowRankLinear(nn.Module):
         self.use_int8_kernel = use_int8_kernel
         self.use_int4_kernel = use_int4_kernel
         self.int4_quant_type = int4_quant_type
+        self.runtime_cache_persistent = False
         self.out_features = u_weight.shape[0]
         self.in_features = v_weight.shape[1]
         self._runtime_u: Optional[torch.Tensor] = None
@@ -1314,6 +1329,8 @@ class TwoPathLowRankLinear(nn.Module):
             out = F.linear(z, self._runtime_u)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=dtype)
+        if not self.runtime_cache_persistent:
+            self.clear_runtime_cache()
         return out
 
 
@@ -1338,6 +1355,7 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         self.use_int8_kernel = use_int8_kernel
         self.use_int4_kernel = use_int4_kernel
         self.int4_quant_type = int4_quant_type
+        self.runtime_cache_persistent = False
         self.out_features = u_basis.shape[0]
         self.in_features = v_basis.shape[1]
         self._runtime_u: Optional[torch.Tensor] = None
@@ -1661,6 +1679,8 @@ class TwoPathSigmaLowRankLinear(nn.Module):
             out = F.linear(z, self._runtime_u)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=dtype)
+        if not self.runtime_cache_persistent:
+            self.clear_runtime_cache()
         return out
 
 
@@ -1737,6 +1757,23 @@ def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
             mod.clear_runtime_cache()
             cleared += 1
     return cleared
+
+
+@torch.no_grad()
+def set_mixed_precision_runtime_cache_policy(model: nn.Module, persistent: bool) -> int:
+    """
+    Configure whether MP modules keep runtime caches across calls.
+    persistent=False reduces peak GPU memory; persistent=True is faster.
+    Returns number of modules updated.
+    """
+    touched = 0
+    for mod in model.modules():
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear)):
+            mod.runtime_cache_persistent = bool(persistent)
+            if not persistent:
+                mod.clear_runtime_cache()
+            touched += 1
+    return touched
 
 
 @torch.no_grad()

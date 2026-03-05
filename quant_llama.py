@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import gc
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,7 @@ from utils.mixed_precision import (
     discover_low_rank_pairs,
     solve_budgeted_topk,
     solve_budgeted_topk_quadratic,
+    set_mixed_precision_runtime_cache_policy,
     strip_original_low_rank_weights,
 )
 
@@ -416,6 +418,10 @@ if __name__ == '__main__':
         help='Quant type for bitsandbytes 4-bit kernels.'
     )
     parser.add_argument(
+        '--mp-persistent-runtime-cache', action='store_true',
+        help='Keep MP runtime caches across calls for speed (uses much more GPU memory).'
+    )
+    parser.add_argument(
         '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
         help='Checkpoint save format. auto -> state_dict when --mp-enable else full model object.'
     )
@@ -434,6 +440,10 @@ if __name__ == '__main__':
     parser.add_argument(
         '--static-groups', action='store_true',
         help='Whether to use static groups; recommended when using `--actorder` for more efficient inference.'
+    )
+    parser.add_argument(
+        '--eval-batch-size', type=int, default=4,
+        help='Batch size used by ppl_eval.'
     )
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
 
@@ -585,6 +595,14 @@ if __name__ == '__main__':
             use_int4_kernel=args.mp_enable_int4_kernel,
             int4_quant_type=args.mp_int4_quant_type,
         )
+        touched = set_mixed_precision_runtime_cache_policy(
+            model=model,
+            persistent=args.mp_persistent_runtime_cache,
+        )
+        print(
+            f"Configured MP runtime cache policy on {touched} modules: "
+            f"persistent={args.mp_persistent_runtime_cache}"
+        )
         finish_stage("apply_quantization")
         mp_bar.close()
     elif args.wbits < 16 and not args.nearest:
@@ -594,7 +612,6 @@ if __name__ == '__main__':
     # if args.save:
     #     llama_pack3(model, quantizers)
     #     torch.save(model.state_dict(), args.save)
-    ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=16, device=args.DEV)
     if args.save:
         if args.mp_enable and pairs is not None:
             strip_stats = strip_original_low_rank_weights(model=model, pairs=pairs)
@@ -636,3 +653,28 @@ if __name__ == '__main__':
                 },
                 args.save,
             )
+
+        # Evaluate from reloaded checkpoint to avoid carrying quantization-stage memory/cache.
+        print("Reloading saved checkpoint before evaluation to reduce peak memory...")
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        model, tokenizer = get_model_from_local(args.save, tokenizer_path=args.tokenizer_path)
+        if args.model_dtype == "fp16":
+            model = model.half()
+        elif args.model_dtype == "bf16":
+            model = model.bfloat16()
+        else:
+            model = model.float()
+        model = model.to(args.DEV)
+        model.eval()
+
+    ppl_eval(
+        model,
+        tokenizer,
+        datasets=['wikitext2'],
+        model_seq_len=args.model_seq_len,
+        batch_size=args.eval_batch_size,
+        device=args.DEV,
+    )
