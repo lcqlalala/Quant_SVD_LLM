@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import gc
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,6 +40,58 @@ def _base_weight_bits_from_dtype(dtype_name: str) -> float:
     if dtype_name in {"fp16", "bf16"}:
         return 16.0
     return 16.0
+
+
+def _pack_int4_signed_rows(q: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    """
+    Pack int8 tensor in [-8, 7] into uint8 (2 values per byte) along dim=1.
+    Returns packed tensor and original column count.
+    """
+    if q.ndim != 2:
+        raise ValueError(f"Expected 2D tensor for int4 packing, got shape={tuple(q.shape)}")
+    q_i16 = q.to(dtype=torch.int16)
+    q_u4 = (q_i16 + 8).clamp(0, 15).to(dtype=torch.uint8)
+    rows, cols = q_u4.shape
+    if cols % 2 == 1:
+        pad = torch.full((rows, 1), 8, dtype=torch.uint8, device=q_u4.device)
+        q_u4 = torch.cat([q_u4, pad], dim=1)
+    lo = q_u4[:, 0::2]
+    hi = q_u4[:, 1::2]
+    packed = (lo | (hi << 4)).contiguous()
+    return packed, cols
+
+
+def pack_lowbit_q_state_dict(state_dict: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+    """
+    Pack low-bit q buffers (ul_q/vl_q) from int8 to packed int4 representation.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    packed_tensors = 0
+    before_bytes = 0
+    after_bytes = 0
+    for key, tensor in state_dict.items():
+        if (
+            key.endswith(".ul_q") or key.endswith(".vl_q")
+        ) and isinstance(tensor, torch.Tensor) and tensor.dtype == torch.int8 and tensor.ndim == 2 and tensor.numel() > 0:
+            t_cpu = tensor.detach().to(device="cpu")
+            t_min = int(t_cpu.min().item())
+            t_max = int(t_cpu.max().item())
+            if t_min >= -8 and t_max <= 7:
+                packed, orig_cols = _pack_int4_signed_rows(t_cpu)
+                out[f"{key}_packed4"] = packed
+                out[f"{key}_orig_cols"] = torch.tensor([orig_cols], dtype=torch.int32)
+                packed_tensors += 1
+                before_bytes += int(t_cpu.numel())
+                after_bytes += int(packed.numel()) + 4
+                continue
+        out[key] = tensor
+
+    stats = {
+        "packed_tensors": float(packed_tensors),
+        "before_bytes": float(before_bytes),
+        "after_bytes": float(after_bytes),
+    }
+    return out, stats
 
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev):
@@ -719,11 +772,14 @@ if __name__ == '__main__':
 
         if save_format == "state_dict":
             cleared = clear_mixed_precision_runtime_cache(model)
+            raw_state_dict = model.state_dict()
+            packed_state_dict, packed_stats = pack_lowbit_q_state_dict(raw_state_dict)
             payload = {
                 "format": "svd_mp_state_dict_v1",
-                "state_dict": model.state_dict(),
+                "state_dict": packed_state_dict,
                 "tokenizer_path": args.tokenizer_path,
                 "base_model_path": getattr(getattr(model, "config", None), "_name_or_path", None),
+                "arch_model_path": args.model_path,
                 "model_dtype": args.model_dtype,
                 "mp_config": {
                     "enabled": bool(args.mp_enable),
@@ -736,8 +792,20 @@ if __name__ == '__main__':
                     "target_compression_ratio": float(args.mp_target_compression_ratio),
                     "allocation_report": alloc_report,
                 },
+                "packed_lowbit_q": True,
+                "packed_lowbit_q_stats": packed_stats,
             }
             torch.save(payload, save_path)
+            if packed_stats["packed_tensors"] > 0:
+                before = packed_stats["before_bytes"] / (1024.0 * 1024.0)
+                after = packed_stats["after_bytes"] / (1024.0 * 1024.0)
+                ratio = packed_stats["before_bytes"] / max(packed_stats["after_bytes"], 1.0)
+                print(
+                    "Packed low-bit q tensors: "
+                    f"count={int(packed_stats['packed_tensors'])}, "
+                    f"bytes_before={before:.2f} MiB, bytes_after={after:.2f} MiB, "
+                    f"pack_ratio={ratio:.4f}x"
+                )
             print(f"Saved minimal state_dict checkpoint ({cleared} runtime caches cleared) to {save_path}")
             report_checkpoint_size(args.model_path, save_path)
         else:
@@ -757,7 +825,11 @@ if __name__ == '__main__':
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        model, tokenizer = get_model_from_local(save_path, tokenizer_path=args.tokenizer_path)
+        model, tokenizer = get_model_from_local(
+            save_path,
+            tokenizer_path=args.tokenizer_path,
+            arch_model_path=args.model_path,
+        )
         if args.model_dtype == "fp16":
             model = model.half()
         elif args.model_dtype == "bf16":

@@ -18,6 +18,15 @@ def _sync_if_cuda(device):
         torch.cuda.synchronize(dev)
 
 
+def _model_weight_memory_bytes(model):
+    total = 0
+    for p in model.parameters():
+        total += p.numel() * p.element_size()
+    for b in model.buffers():
+        total += b.numel() * b.element_size()
+    return total
+
+
 @torch.no_grad()
 def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=32, device="cuda"):
     model.to(device)
@@ -63,7 +72,15 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
         )
     print("PPL after pruning: {}".format(ppls))
     print("Throughput (tokens/s): {}".format(throughput))
-    print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
+    weight_mib = _model_weight_memory_bytes(model) / (1024.0 * 1024.0)
+    if torch.device(device).type == "cuda":
+        alloc_mib = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+        reserved_mib = torch.cuda.memory_reserved() / (1024.0 * 1024.0)
+        print("Weight Memory (params+buffers): {:.2f} MiB".format(weight_mib))
+        print("CUDA Allocated Memory: {:.2f} MiB".format(alloc_mib))
+        print("CUDA Reserved Memory: {:.2f} MiB\n".format(reserved_mib))
+    else:
+        print("Weight Memory (params+buffers): {:.2f} MiB\n".format(weight_mib))
 
 # only call this function when for 65b or more model    
 @torch.no_grad()
@@ -172,7 +189,12 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
         )
     print("PPL after pruning: {}".format(ppls))
     print("Throughput (tokens/s): {}".format(throughput))
-    print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
+    weight_mib = _model_weight_memory_bytes(model) / (1024.0 * 1024.0)
+    alloc_mib = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+    reserved_mib = torch.cuda.memory_reserved() / (1024.0 * 1024.0)
+    print("Weight Memory (params+buffers): {:.2f} MiB".format(weight_mib))
+    print("CUDA Allocated Memory: {:.2f} MiB".format(alloc_mib))
+    print("CUDA Reserved Memory: {:.2f} MiB\n".format(reserved_mib))
 
 @torch.no_grad()
 def eff_eval(model, tokenizer, dataset='wikitext2', original_len=4, generated_len=128, batch_size=1, device="cuda"):
