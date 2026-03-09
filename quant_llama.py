@@ -32,6 +32,14 @@ from utils.mixed_precision import (
 current_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_path)
 
+
+def _base_weight_bits_from_dtype(dtype_name: str) -> float:
+    if dtype_name == "fp32":
+        return 32.0
+    if dtype_name in {"fp16", "bf16"}:
+        return 16.0
+    return 16.0
+
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev):
     print('Starting ...')
@@ -250,7 +258,13 @@ def llama_pack3(model, quantizers):
 
 
 @torch.no_grad()
-def report_mixed_precision_allocation(pairs, alloc):
+def report_mixed_precision_allocation(
+    pairs,
+    alloc,
+    high_bit: float,
+    low_bit: float,
+    base_bits: float = None,
+):
     total = 0
     high = 0
     for p in pairs:
@@ -260,7 +274,22 @@ def report_mixed_precision_allocation(pairs, alloc):
         total += int(mask.numel())
         high += int(mask.sum().item())
     low = total - high
-    print(f"Mixed-precision allocation: high={high}, low={low}, total={total}")
+    avg_bits = 0.0
+    if total > 0:
+        high_bits = float(high_bit)
+        low_bits = float(low_bit)
+        avg_bits = (high * high_bits + low * low_bits) / float(total)
+    msg = f"Mixed-precision allocation: high={high}, low={low}, total={total}, avg_bits={avg_bits:.4f}"
+    if base_bits is not None and avg_bits > 0:
+        est_ratio = float(base_bits) / avg_bits
+        msg += f", est_lowrank_compression_ratio={est_ratio:.4f}x"
+    print(msg)
+    return {
+        "high": high,
+        "low": low,
+        "total": total,
+        "avg_bits": avg_bits,
+    }
 
 
 if __name__ == '__main__':
@@ -406,6 +435,11 @@ if __name__ == '__main__':
         help='Target average bit-width under budgeted top-k selection.'
     )
     parser.add_argument(
+        '--mp-target-compression-ratio', type=float, default=0.0,
+        help='If >0, auto-set mp_avg_bit from target low-rank compression ratio. '
+             'Computed as mp_avg_bit = base_weight_bits / ratio, then clamped to [mp-low-bit, mp-high-bit].'
+    )
+    parser.add_argument(
         '--mp-disable-int8-kernel', action='store_true',
         help='Disable int8 GEMM kernel path in two-path quantized layers and force float fallback.'
     )
@@ -448,6 +482,21 @@ if __name__ == '__main__':
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
 
     args = parser.parse_args()
+    base_weight_bits = _base_weight_bits_from_dtype(args.model_dtype)
+    if args.mp_target_compression_ratio is not None and args.mp_target_compression_ratio > 0:
+        target_avg = base_weight_bits / float(args.mp_target_compression_ratio)
+        clamped_avg = min(float(args.mp_high_bit), max(float(args.mp_low_bit), target_avg))
+        if abs(clamped_avg - target_avg) > 1e-8:
+            print(
+                "Warning: target compression ratio implies avg bit outside [low, high]. "
+                f"target_avg_bit={target_avg:.4f}, clamped={clamped_avg:.4f}"
+            )
+        args.mp_avg_bit = clamped_avg
+        print(
+            f"Auto-set mp_avg_bit={args.mp_avg_bit:.4f} from "
+            f"mp_target_compression_ratio={args.mp_target_compression_ratio:.4f} "
+            f"(base_weight_bits={base_weight_bits:.1f})"
+        )
 
     def resolve_save_path(save_arg: str) -> str:
         if save_arg is None or len(save_arg.strip()) == 0:
@@ -463,6 +512,24 @@ if __name__ == '__main__':
         if parent:
             os.makedirs(parent, exist_ok=True)
         return save_arg
+
+    def report_checkpoint_size(src_path: str, dst_path: str):
+        try:
+            dst_bytes = os.path.getsize(dst_path)
+        except OSError:
+            print(f"Warning: failed to stat saved checkpoint: {dst_path}")
+            return
+        dst_mib = dst_bytes / (1024.0 * 1024.0)
+        msg = f"Saved checkpoint size: {dst_mib:.2f} MiB ({dst_bytes} bytes)"
+        if src_path is not None and len(src_path) > 0 and os.path.isfile(src_path):
+            try:
+                src_bytes = os.path.getsize(src_path)
+                src_mib = src_bytes / (1024.0 * 1024.0)
+                ratio = float(src_bytes) / max(float(dst_bytes), 1.0)
+                msg += f" | source: {src_mib:.2f} MiB | compression_ratio={ratio:.4f}x"
+            except OSError:
+                pass
+        print(msg)
 
     model, tokenizer = get_model_from_local(args.model_path, tokenizer_path=args.tokenizer_path)
     if args.model_dtype == "fp16":
@@ -482,6 +549,7 @@ if __name__ == '__main__':
     )
 
     pairs = None
+    alloc_report = None
     if args.mp_enable:
         mp_stages = ["discover_pairs"]
         if args.mp_sigma_mode == "calibrated":
@@ -597,7 +665,13 @@ if __name__ == '__main__':
         finish_stage("kfac_stats")
         finish_stage("allocation")
 
-        report_mixed_precision_allocation(pairs, alloc)
+        alloc_report = report_mixed_precision_allocation(
+            pairs,
+            alloc,
+            high_bit=args.mp_high_bit,
+            low_bit=args.mp_low_bit,
+            base_bits=base_weight_bits,
+        )
         apply_two_path_quantization(
             model=model,
             pairs=pairs,
@@ -659,10 +733,13 @@ if __name__ == '__main__':
                     "use_int8_kernel": bool(not args.mp_disable_int8_kernel),
                     "use_int4_kernel": bool(args.mp_enable_int4_kernel),
                     "int4_quant_type": args.mp_int4_quant_type,
+                    "target_compression_ratio": float(args.mp_target_compression_ratio),
+                    "allocation_report": alloc_report,
                 },
             }
             torch.save(payload, save_path)
             print(f"Saved minimal state_dict checkpoint ({cleared} runtime caches cleared) to {save_path}")
+            report_checkpoint_size(args.model_path, save_path)
         else:
             torch.save(
                 {
@@ -672,6 +749,7 @@ if __name__ == '__main__':
                 save_path,
             )
             print(f"Saved full checkpoint to {save_path}")
+            report_checkpoint_size(args.model_path, save_path)
 
         # Evaluate from reloaded checkpoint to avoid carrying quantization-stage memory/cache.
         print("Reloading saved checkpoint before evaluation to reduce peak memory...")
