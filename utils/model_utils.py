@@ -149,6 +149,27 @@ def _install_mp_modules_from_state_dict(
         prefixes.add(prefix)
 
     installed = 0
+
+    def _rank_from_q(prefix: str, q_name: str, s_name: str) -> int:
+        q_key = f"{prefix}.{q_name}"
+        s_key = f"{prefix}.{s_name}"
+        if q_key in state_dict and isinstance(state_dict[q_key], torch.Tensor):
+            q = state_dict[q_key]
+            if q.numel() == 0:
+                return 0
+            if q.ndim >= 2:
+                return int(q.shape[1])
+            if s_key in state_dict and isinstance(state_dict[s_key], torch.Tensor):
+                s = state_dict[s_key]
+                if s.numel() > 0:
+                    return int(s.numel())
+            return 0
+        if s_key in state_dict and isinstance(state_dict[s_key], torch.Tensor):
+            s = state_dict[s_key]
+            if s.numel() > 0:
+                return int(s.numel())
+        return 0
+
     for prefix in sorted(prefixes):
         parent_path, mp_name = prefix.rsplit(".", 1)
         if not mp_name.endswith("_mp_proj"):
@@ -164,10 +185,8 @@ def _install_mp_modules_from_state_dict(
         if not isinstance(u_mod, nn.Linear) or not isinstance(v_mod, nn.Linear):
             continue
 
-        uh_key = f"{prefix}.uh_q"
-        ul_key = f"{prefix}.ul_q"
-        nh = int(state_dict[uh_key].shape[1]) if uh_key in state_dict else 0
-        nl = int(state_dict[ul_key].shape[1]) if ul_key in state_dict else 0
+        nh = _rank_from_q(prefix, "uh_q", "uh_s")
+        nl = _rank_from_q(prefix, "ul_q", "ul_s")
         high_idx = torch.arange(nh, dtype=torch.long)
         low_idx = torch.arange(nh, nh + nl, dtype=torch.long)
 
