@@ -23,7 +23,7 @@ def get_model_from_huggingface(model_id):
     return model, tokenizer
 
 def _resolve_tokenizer_source(model_path: str, tokenizer_path: Optional[str], model_obj) -> Optional[str]:
-    if tokenizer_path:
+    if tokenizer_path and not tokenizer_path.endswith(".pt"):
         return tokenizer_path
     if os.path.isdir(model_path):
         return model_path
@@ -47,6 +47,27 @@ def _load_tokenizer(tokenizer_source: Optional[str]):
         return None
 
 
+def _load_model_object_from_checkpoint(checkpoint_path: str) -> Optional[nn.Module]:
+    """
+    Best-effort loader for a full model object checkpoint.
+    Returns None when the checkpoint does not contain a direct model object.
+    """
+    if not isinstance(checkpoint_path, str) or not os.path.isfile(checkpoint_path):
+        return None
+    try:
+        obj = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+    except Exception:
+        return None
+    if isinstance(obj, nn.Module):
+        return obj
+    if isinstance(obj, dict):
+        if "model" in obj and isinstance(obj["model"], nn.Module):
+            return obj["model"]
+        if "module" in obj and isinstance(obj["module"], nn.Module):
+            return obj["module"]
+    return None
+
+
 def _get_submodule_by_path(model: nn.Module, path: str) -> nn.Module:
     if path == "":
         return model
@@ -56,11 +77,59 @@ def _get_submodule_by_path(model: nn.Module, path: str) -> nn.Module:
     return cur
 
 
+def _unpack_int4_signed_rows(packed: torch.Tensor, orig_cols: int) -> torch.Tensor:
+    if packed.ndim != 2:
+        raise ValueError(f"Expected 2D packed tensor, got shape={tuple(packed.shape)}")
+    p = packed.to(dtype=torch.uint8)
+    lo = (p & 0x0F).to(torch.int16)
+    hi = ((p >> 4) & 0x0F).to(torch.int16)
+    rows = p.shape[0]
+    out = torch.empty((rows, p.shape[1] * 2), dtype=torch.int16, device=p.device)
+    out[:, 0::2] = lo
+    out[:, 1::2] = hi
+    out = out[:, :orig_cols]
+    return (out - 8).to(torch.int8)
+
+
+def _unpack_lowbit_q_state_dict(state_dict: dict) -> dict:
+    """
+    Restore packed low-bit q tensors saved as:
+      <key>_packed4 (uint8), <key>_orig_cols (int32 scalar tensor)
+    back to:
+      <key> (int8)
+    """
+    out = {}
+    packed_suffix = "_packed4"
+    cols_suffix = "_orig_cols"
+
+    packed_bases = set()
+    for k in state_dict.keys():
+        if k.endswith(packed_suffix):
+            packed_bases.add(k[: -len(packed_suffix)])
+
+    for k, v in state_dict.items():
+        if k.endswith(packed_suffix) or k.endswith(cols_suffix):
+            continue
+        out[k] = v
+
+    for base in sorted(packed_bases):
+        packed_key = f"{base}{packed_suffix}"
+        cols_key = f"{base}{cols_suffix}"
+        packed = state_dict[packed_key]
+        if cols_key in state_dict and isinstance(state_dict[cols_key], torch.Tensor):
+            orig_cols = int(state_dict[cols_key].view(-1)[0].item())
+        else:
+            orig_cols = int(packed.shape[1] * 2)
+        out[base] = _unpack_int4_signed_rows(packed, orig_cols)
+
+    return out
+
+
 def _install_mp_modules_from_state_dict(
     model: nn.Module,
     state_dict: dict,
     mp_config: Optional[dict] = None,
-):
+) -> int:
     from utils.mixed_precision import TwoPathLowRankLinear, TwoPathSigmaLowRankLinear
 
     use_int8_kernel = True
@@ -79,6 +148,7 @@ def _install_mp_modules_from_state_dict(
         prefix = key.split(marker)[0] + "_mp_proj"
         prefixes.add(prefix)
 
+    installed = 0
     for prefix in sorted(prefixes):
         parent_path, mp_name = prefix.rsplit(".", 1)
         if not mp_name.endswith("_mp_proj"):
@@ -137,9 +207,15 @@ def _install_mp_modules_from_state_dict(
                 int4_quant_type=int4_quant_type,
             )
         setattr(parent, mp_name, mp)
+        installed += 1
+    return installed
 
 
-def get_model_from_local(model_id: str, tokenizer_path: Optional[str] = None) -> Tuple[nn.Module, object]:
+def get_model_from_local(
+    model_id: str,
+    tokenizer_path: Optional[str] = None,
+    arch_model_path: Optional[str] = None,
+) -> Tuple[nn.Module, object]:
     # HF local directory path
     if os.path.isdir(model_id):
         from transformers import AutoModelForCausalLM
@@ -168,24 +244,60 @@ def get_model_from_local(model_id: str, tokenizer_path: Optional[str] = None) ->
         elif obj.get("format", None) == "svd_mp_state_dict_v1" and isinstance(obj.get("state_dict", None), dict):
             from transformers import AutoModelForCausalLM
 
-            base_model_path = tokenizer_path or obj.get("base_model_path", None)
-            if base_model_path is None:
-                raise ValueError(
-                    "State-dict checkpoint requires base model path to rebuild architecture. "
-                    "Please pass --tokenizer_path (or save checkpoint with base_model_path)."
+            state_dict = obj["state_dict"]
+            if bool(obj.get("packed_lowbit_q", False)):
+                state_dict = _unpack_lowbit_q_state_dict(state_dict)
+
+            # Prefer loading from an SVD template checkpoint (same architecture as the saved state_dict).
+            # Falling back to HF base model can silently fail to install MP modules.
+            model = None
+            tried_arch_paths = []
+            for candidate in [arch_model_path, obj.get("arch_model_path", None), obj.get("svd_template_path", None)]:
+                if not isinstance(candidate, str) or len(candidate) == 0:
+                    continue
+                if os.path.abspath(candidate) == os.path.abspath(model_id):
+                    continue
+                tried_arch_paths.append(candidate)
+                model = _load_model_object_from_checkpoint(candidate)
+                if model is not None:
+                    print(f"Loaded SVD template architecture from: {candidate}")
+                    break
+
+            if model is None:
+                base_model_path = obj.get("base_model_path", None)
+                if base_model_path is None:
+                    raise ValueError(
+                        "State-dict checkpoint requires a base architecture. "
+                        "Provide --arch_model_path (recommended, SVD template checkpoint) "
+                        "or save checkpoint with base_model_path."
+                    )
+                model = AutoModelForCausalLM.from_pretrained(
+                    base_model_path,
+                    device_map="cpu",
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
                 )
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model_path,
-                device_map="cpu",
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-            )
-            _install_mp_modules_from_state_dict(model, obj["state_dict"], obj.get("mp_config", None))
-            missing, unexpected = model.load_state_dict(obj["state_dict"], strict=False)
+                if len(tried_arch_paths) > 0:
+                    print(
+                        "Warning: failed to load SVD template architecture from provided paths; "
+                        f"falling back to base model: {base_model_path}"
+                    )
+
+            installed = _install_mp_modules_from_state_dict(model, state_dict, obj.get("mp_config", None))
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if installed > 0:
+                print(f"Installed MP modules from checkpoint: {installed}")
             if len(unexpected) > 0:
                 print(f"Warning: unexpected keys while loading state_dict: {len(unexpected)}")
             if len(missing) > 0:
                 print(f"Warning: missing keys while loading state_dict: {len(missing)}")
+            has_mp_keys = any("_mp_proj." in k for k in state_dict.keys())
+            if has_mp_keys and installed == 0:
+                raise ValueError(
+                    "Detected MP state_dict keys but installed 0 MP modules. "
+                    "This means architecture mismatch (likely loading dense HF model instead of SVD template). "
+                    "Please pass --arch_model_path to the original SVD checkpoint used before quantization."
+                )
         elif isinstance(obj.get("state_dict", None), dict):
             raise ValueError(
                 "Checkpoint only contains 'state_dict'. This repo requires a full model object checkpoint "
@@ -196,7 +308,10 @@ def get_model_from_local(model_id: str, tokenizer_path: Optional[str] = None) ->
 
         tokenizer = obj.get("tokenizer", None)
         if tokenizer is None and obj.get("format", None) == "svd_mp_state_dict_v1":
-            tokenizer = _load_tokenizer(tokenizer_path or obj.get("tokenizer_path", None) or obj.get("base_model_path", None))
+            tok_source = tokenizer_path
+            if isinstance(tok_source, str) and tok_source.endswith(".pt"):
+                tok_source = None
+            tokenizer = _load_tokenizer(tok_source or obj.get("tokenizer_path", None) or obj.get("base_model_path", None))
     elif isinstance(obj, nn.Module):
         model = obj
 

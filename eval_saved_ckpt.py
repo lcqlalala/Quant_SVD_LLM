@@ -1,5 +1,6 @@
 import argparse
 import os
+import inspect
 
 import torch
 
@@ -56,11 +57,23 @@ def main():
     if args.inspect_only:
         return
 
-    model, tokenizer = get_model_from_local(
-        args.model_path,
-        tokenizer_path=args.tokenizer_path,
-        arch_model_path=args.arch_model_path,
-    )
+    sig = inspect.signature(get_model_from_local)
+    if "arch_model_path" in sig.parameters:
+        model, tokenizer = get_model_from_local(
+            args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            arch_model_path=args.arch_model_path,
+        )
+    else:
+        if args.arch_model_path:
+            print(
+                "Warning: current utils/model_utils.py does not support --arch_model_path. "
+                "Ignoring it; please sync latest model_utils.py to avoid architecture mismatch."
+            )
+        model, tokenizer = get_model_from_local(
+            args.model_path,
+            tokenizer_path=args.tokenizer_path,
+        )
     if args.model_dtype == "fp16":
         model = model.half()
     elif args.model_dtype == "bf16":
