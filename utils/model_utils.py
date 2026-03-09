@@ -149,6 +149,7 @@ def _install_mp_modules_from_state_dict(
         prefixes.add(prefix)
 
     installed = 0
+    stripped_uv = 0
 
     def _rank_from_q(prefix: str, q_name: str, s_name: str) -> int:
         q_key = f"{prefix}.{q_name}"
@@ -226,7 +227,17 @@ def _install_mp_modules_from_state_dict(
                 int4_quant_type=int4_quant_type,
             )
         setattr(parent, mp_name, mp)
+        # For MP checkpoints, original low-rank u/v modules are redundant and not saved.
+        # Replacing them with Identity avoids load-time missing keys and reduces memory.
+        if hasattr(parent, u_name):
+            setattr(parent, u_name, nn.Identity())
+            stripped_uv += 1
+        if hasattr(parent, v_name):
+            setattr(parent, v_name, nn.Identity())
+            stripped_uv += 1
         installed += 1
+    if stripped_uv > 0:
+        print(f"Stripped original u/v modules while installing MP: {stripped_uv}")
     return installed
 
 
