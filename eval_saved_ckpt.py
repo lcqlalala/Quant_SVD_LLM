@@ -16,6 +16,8 @@ def inspect_checkpoint(path: str) -> None:
         fmt = obj.get("format", None)
         if fmt is not None:
             print(f"format: {fmt}")
+        if "arch_model_path" in obj:
+            print(f"arch_model_path: {obj.get('arch_model_path')}")
         if "state_dict" in obj and isinstance(obj["state_dict"], dict):
             sd = obj["state_dict"]
             print(f"state_dict_keys: {len(sd)}")
@@ -33,6 +35,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True, help="Path to saved checkpoint (.pt)")
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Tokenizer path for loading")
+    parser.add_argument(
+        "--arch_model_path",
+        type=str,
+        default=None,
+        help="Original SVD template checkpoint path (required when state_dict cannot rebuild MP modules from base model).",
+    )
     parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "ptb", "c4"])
     parser.add_argument("--model_seq_len", type=int, default=2048)
     parser.add_argument("--eval_batch_size", type=int, default=1)
@@ -48,7 +56,11 @@ def main():
     if args.inspect_only:
         return
 
-    model, tokenizer = get_model_from_local(args.model_path, tokenizer_path=args.tokenizer_path)
+    model, tokenizer = get_model_from_local(
+        args.model_path,
+        tokenizer_path=args.tokenizer_path,
+        arch_model_path=args.arch_model_path,
+    )
     if args.model_dtype == "fp16":
         model = model.half()
     elif args.model_dtype == "bf16":
@@ -70,4 +82,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
