@@ -1063,6 +1063,7 @@ class TwoPathLowRankLinear(nn.Module):
         int4_quant_type: str = "nf4",
     ):
         super().__init__()
+        meta_dtype = torch.float16
         self.high_bit = high_bit
         self.low_bit = low_bit
         self.use_int8_kernel = use_int8_kernel
@@ -1096,32 +1097,36 @@ class TwoPathLowRankLinear(nn.Module):
 
         if self.high_idx.numel() > 0:
             uh, vh = u_weight[:, self.high_idx], v_weight[self.high_idx, :]
-            self.register_buffer("uh_q", self._q_per_row(uh, high_bit)[0], persistent=True)
-            self.register_buffer("uh_s", self._q_per_row(uh, high_bit)[1], persistent=True)
-            self.register_buffer("vh_q", self._q_per_row(vh, high_bit)[0], persistent=True)
-            self.register_buffer("vh_s", self._q_per_row(vh, high_bit)[1], persistent=True)
+            uh_q, uh_s = self._q_per_row(uh, high_bit)
+            vh_q, vh_s = self._q_per_row(vh, high_bit)
+            self.register_buffer("uh_q", uh_q, persistent=True)
+            self.register_buffer("uh_s", uh_s.to(dtype=meta_dtype), persistent=True)
+            self.register_buffer("vh_q", vh_q, persistent=True)
+            self.register_buffer("vh_s", vh_s.to(dtype=meta_dtype), persistent=True)
         else:
             self.register_buffer("uh_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("uh_s", torch.empty(0), persistent=True)
+            self.register_buffer("uh_s", torch.empty(0, dtype=meta_dtype), persistent=True)
             self.register_buffer("vh_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("vh_s", torch.empty(0), persistent=True)
+            self.register_buffer("vh_s", torch.empty(0, dtype=meta_dtype), persistent=True)
 
         if self.low_idx.numel() > 0:
             ul, vl = u_weight[:, self.low_idx], v_weight[self.low_idx, :]
-            self.register_buffer("ul_q", self._q_per_row(ul, low_bit)[0], persistent=True)
-            self.register_buffer("ul_s", self._q_per_row(ul, low_bit)[1], persistent=True)
-            self.register_buffer("vl_q", self._q_per_row(vl, low_bit)[0], persistent=True)
-            self.register_buffer("vl_s", self._q_per_row(vl, low_bit)[1], persistent=True)
+            ul_q, ul_s = self._q_per_row(ul, low_bit)
+            vl_q, vl_s = self._q_per_row(vl, low_bit)
+            self.register_buffer("ul_q", ul_q, persistent=True)
+            self.register_buffer("ul_s", ul_s.to(dtype=meta_dtype), persistent=True)
+            self.register_buffer("vl_q", vl_q, persistent=True)
+            self.register_buffer("vl_s", vl_s.to(dtype=meta_dtype), persistent=True)
         else:
             self.register_buffer("ul_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("ul_s", torch.empty(0), persistent=True)
+            self.register_buffer("ul_s", torch.empty(0, dtype=meta_dtype), persistent=True)
             self.register_buffer("vl_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("vl_s", torch.empty(0), persistent=True)
+            self.register_buffer("vl_s", torch.empty(0, dtype=meta_dtype), persistent=True)
 
         if bias is None:
             self.register_buffer("bias", None, persistent=True)
         else:
-            self.register_buffer("bias", bias.detach().clone().float(), persistent=True)
+            self.register_buffer("bias", bias.detach().clone().to(dtype=meta_dtype), persistent=True)
 
     @staticmethod
     def _q_per_row(w: torch.Tensor, bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1129,7 +1134,7 @@ class TwoPathLowRankLinear(nn.Module):
         w = w.float()
         s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / qmax
         q = torch.round(w / s).clamp(-qmax, qmax).to(torch.int8)
-        return q.cpu(), s.squeeze(1).cpu()
+        return q.cpu(), s.squeeze(1).to(dtype=torch.float16).cpu()
 
     @staticmethod
     def _deq_per_row(q: torch.Tensor, s: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -1350,6 +1355,7 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         int4_quant_type: str = "nf4",
     ):
         super().__init__()
+        meta_dtype = torch.float16
         self.high_bit = high_bit
         self.low_bit = low_bit
         self.use_int8_kernel = use_int8_kernel
@@ -1387,39 +1393,43 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         if self.high_idx.numel() > 0:
             uh = u_basis[:, self.high_idx]
             vh = v_basis[self.high_idx, :]
-            sh = sigma[self.high_idx].float().cpu()
-            self.register_buffer("uh_q", self._q_per_row(uh, high_bit)[0], persistent=True)
-            self.register_buffer("uh_s", self._q_per_row(uh, high_bit)[1], persistent=True)
-            self.register_buffer("vh_q", self._q_per_row(vh, high_bit)[0], persistent=True)
-            self.register_buffer("vh_s", self._q_per_row(vh, high_bit)[1], persistent=True)
+            sh = sigma[self.high_idx].to(dtype=meta_dtype).cpu()
+            uh_q, uh_s = self._q_per_row(uh, high_bit)
+            vh_q, vh_s = self._q_per_row(vh, high_bit)
+            self.register_buffer("uh_q", uh_q, persistent=True)
+            self.register_buffer("uh_s", uh_s.to(dtype=meta_dtype), persistent=True)
+            self.register_buffer("vh_q", vh_q, persistent=True)
+            self.register_buffer("vh_s", vh_s.to(dtype=meta_dtype), persistent=True)
             self.register_buffer("sh", sh, persistent=True)
         else:
             self.register_buffer("uh_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("uh_s", torch.empty(0), persistent=True)
+            self.register_buffer("uh_s", torch.empty(0, dtype=meta_dtype), persistent=True)
             self.register_buffer("vh_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("vh_s", torch.empty(0), persistent=True)
-            self.register_buffer("sh", torch.empty(0), persistent=True)
+            self.register_buffer("vh_s", torch.empty(0, dtype=meta_dtype), persistent=True)
+            self.register_buffer("sh", torch.empty(0, dtype=meta_dtype), persistent=True)
 
         if self.low_idx.numel() > 0:
             ul = u_basis[:, self.low_idx]
             vl = v_basis[self.low_idx, :]
-            sl = sigma[self.low_idx].float().cpu()
-            self.register_buffer("ul_q", self._q_per_row(ul, low_bit)[0], persistent=True)
-            self.register_buffer("ul_s", self._q_per_row(ul, low_bit)[1], persistent=True)
-            self.register_buffer("vl_q", self._q_per_row(vl, low_bit)[0], persistent=True)
-            self.register_buffer("vl_s", self._q_per_row(vl, low_bit)[1], persistent=True)
+            sl = sigma[self.low_idx].to(dtype=meta_dtype).cpu()
+            ul_q, ul_s = self._q_per_row(ul, low_bit)
+            vl_q, vl_s = self._q_per_row(vl, low_bit)
+            self.register_buffer("ul_q", ul_q, persistent=True)
+            self.register_buffer("ul_s", ul_s.to(dtype=meta_dtype), persistent=True)
+            self.register_buffer("vl_q", vl_q, persistent=True)
+            self.register_buffer("vl_s", vl_s.to(dtype=meta_dtype), persistent=True)
             self.register_buffer("sl", sl, persistent=True)
         else:
             self.register_buffer("ul_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("ul_s", torch.empty(0), persistent=True)
+            self.register_buffer("ul_s", torch.empty(0, dtype=meta_dtype), persistent=True)
             self.register_buffer("vl_q", torch.empty(0, dtype=torch.int8), persistent=True)
-            self.register_buffer("vl_s", torch.empty(0), persistent=True)
-            self.register_buffer("sl", torch.empty(0), persistent=True)
+            self.register_buffer("vl_s", torch.empty(0, dtype=meta_dtype), persistent=True)
+            self.register_buffer("sl", torch.empty(0, dtype=meta_dtype), persistent=True)
 
         if bias is None:
             self.register_buffer("bias", None, persistent=True)
         else:
-            self.register_buffer("bias", bias.detach().clone().float(), persistent=True)
+            self.register_buffer("bias", bias.detach().clone().to(dtype=meta_dtype), persistent=True)
 
     @staticmethod
     def _q_per_row(w: torch.Tensor, bits: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1427,7 +1437,7 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         w = w.float()
         s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / qmax
         q = torch.round(w / s).clamp(-qmax, qmax).to(torch.int8)
-        return q.cpu(), s.squeeze(1).cpu()
+        return q.cpu(), s.squeeze(1).to(dtype=torch.float16).cpu()
 
     @staticmethod
     def _deq_per_row(q: torch.Tensor, s: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
