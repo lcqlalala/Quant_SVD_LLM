@@ -11,17 +11,34 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
+
+def _sync_if_cuda(device):
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
 @torch.no_grad()
 def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=32, device="cuda"):
     model.to(device)
     model.eval()
     ppls = {}
+    throughput = {}
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=model_seq_len, batch_size = batch_size)
         nlls = []
+        total_tokens = 0
+        total_target_tokens = 0
+        total_forward_time = 0.0
         for batch in tqdm(test_loader):
             batch = batch.to(device)
+            _sync_if_cuda(device)
+            t0 = time.perf_counter()
             output = model(batch, use_cache=False)
+            _sync_if_cuda(device)
+            total_forward_time += (time.perf_counter() - t0)
+            total_tokens += int(batch.numel())
+            total_target_tokens += int(batch[:, 1:].numel())
             lm_logits = output.logits
             if torch.isfinite(lm_logits).all():
                 shift_logits = lm_logits[:, :-1, :].contiguous()
@@ -32,7 +49,20 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
                 nlls.append(loss)
         ppl = np.exp(torch.cat(nlls, dim=-1).mean().item())
         ppls[dataset] = ppl
+        tps_all = total_tokens / max(total_forward_time, 1e-12)
+        tps_target = total_target_tokens / max(total_forward_time, 1e-12)
+        throughput[dataset] = {
+            "tokens_per_sec_all": tps_all,
+            "tokens_per_sec_target": tps_target,
+            "forward_time_sec": total_forward_time,
+        }
+        print(
+            f"[{dataset}] throughput: "
+            f"all_tokens/s={tps_all:.2f}, target_tokens/s={tps_target:.2f}, "
+            f"forward_time={total_forward_time:.2f}s"
+        )
     print("PPL after pruning: {}".format(ppls))
+    print("Throughput (tokens/s): {}".format(throughput))
     print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
 
 # only call this function when for 65b or more model    
@@ -58,11 +88,17 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
     lm_head = model.lm_head.cuda()
     model.eval()
     ppls = {}
+    throughput = {}
     layers = model.model.layers
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=seq_len, batch_size = batch_size)
         nlls = []
+        total_tokens = 0
+        total_target_tokens = 0
+        total_forward_time = 0.0
         for batch in tqdm(test_loader):
+            _sync_if_cuda("cuda")
+            t0 = time.perf_counter()
             model.model.embed_tokens = model.model.embed_tokens.cuda()
             model.model.norm = model.model.norm.cuda()
             layers[0] = layers[0].cuda()
@@ -105,6 +141,10 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
                 layers[i] = layer.cpu()
                 inps = outs
                 torch.cuda.empty_cache()
+            _sync_if_cuda("cuda")
+            total_forward_time += (time.perf_counter() - t0)
+            total_tokens += int(batch.numel())
+            total_target_tokens += int(batch[:, 1:].numel())
             hidden_states = norm(outs)
             lm_logits = lm_head(hidden_states)
             if torch.isfinite(lm_logits).all():
@@ -118,7 +158,20 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
                 print("warning: nan or inf in lm_logits")
         ppl = np.exp(torch.cat(nlls, dim=-1).mean().item())
         ppls[dataset] = ppl
+        tps_all = total_tokens / max(total_forward_time, 1e-12)
+        tps_target = total_target_tokens / max(total_forward_time, 1e-12)
+        throughput[dataset] = {
+            "tokens_per_sec_all": tps_all,
+            "tokens_per_sec_target": tps_target,
+            "forward_time_sec": total_forward_time,
+        }
+        print(
+            f"[{dataset}] throughput: "
+            f"all_tokens/s={tps_all:.2f}, target_tokens/s={tps_target:.2f}, "
+            f"forward_time={total_forward_time:.2f}s"
+        )
     print("PPL after pruning: {}".format(ppls))
+    print("Throughput (tokens/s): {}".format(throughput))
     print("Weight Memory: {} MiB\n".format(torch.cuda.memory_allocated()/1024/1024))
 
 @torch.no_grad()
@@ -158,4 +211,3 @@ def eff_eval(model, tokenizer, dataset='wikitext2', original_len=4, generated_le
     print("Weight Memory: {} GB".format(weight_memory/(1024 ** 3)))
     print("Activation Memory: {} GB".format((end_memory - start_memory)/(1024 ** 3)))
     print("Throughput: {} tokens/sec".format(token_num / throughput))
-
