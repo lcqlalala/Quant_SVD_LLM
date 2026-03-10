@@ -35,10 +35,12 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
     throughput = {}
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=model_seq_len, batch_size = batch_size)
-        nlls = []
+        nll_sum = 0.0
+        nll_count = 0
         total_tokens = 0
         total_target_tokens = 0
         total_forward_time = 0.0
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
         for batch in tqdm(test_loader):
             batch = batch.to(device)
             _sync_if_cuda(device)
@@ -52,11 +54,17 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
             if torch.isfinite(lm_logits).all():
                 shift_logits = lm_logits[:, :-1, :].contiguous()
                 shift_labels = batch[:, 1:].contiguous()
-                
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-                loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                nlls.append(loss)
-        ppl = np.exp(torch.cat(nlls, dim=-1).mean().item())
+                loss_sum = loss_fct(
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                )
+                nll_sum += float(loss_sum.item())
+                nll_count += int(shift_labels.numel())
+            del output, lm_logits
+        if nll_count == 0:
+            ppl = float("inf")
+        else:
+            ppl = float(np.exp(nll_sum / max(nll_count, 1)))
         ppls[dataset] = ppl
         tps_all = total_tokens / max(total_forward_time, 1e-12)
         tps_target = total_target_tokens / max(total_forward_time, 1e-12)
@@ -109,10 +117,12 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
     layers = model.model.layers
     for dataset in datasets:
         test_loader = get_test_data(dataset, tokenizer, seq_len=seq_len, batch_size = batch_size)
-        nlls = []
+        nll_sum = 0.0
+        nll_count = 0
         total_tokens = 0
         total_target_tokens = 0
         total_forward_time = 0.0
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
         for batch in tqdm(test_loader):
             _sync_if_cuda("cuda")
             t0 = time.perf_counter()
@@ -167,13 +177,18 @@ def ppl_eval_large(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], seq_le
             if torch.isfinite(lm_logits).all():
                 shift_logits = lm_logits[:, :-1, :].contiguous()
                 shift_labels = batch[:, 1:].contiguous().cuda()
-                
-                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-                loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                nlls.append(loss)
+                loss_sum = loss_fct(
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                )
+                nll_sum += float(loss_sum.item())
+                nll_count += int(shift_labels.numel())
             else:
                 print("warning: nan or inf in lm_logits")
-        ppl = np.exp(torch.cat(nlls, dim=-1).mean().item())
+        if nll_count == 0:
+            ppl = float("inf")
+        else:
+            ppl = float(np.exp(nll_sum / max(nll_count, 1)))
         ppls[dataset] = ppl
         tps_all = total_tokens / max(total_forward_time, 1e-12)
         tps_target = total_target_tokens / max(total_forward_time, 1e-12)
