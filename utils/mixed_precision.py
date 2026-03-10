@@ -1778,6 +1778,48 @@ class Int8WeightLinear(nn.Module):
         return out
 
 
+class Int8Embedding(nn.Module):
+    """
+    Int8 weight-only embedding with per-row symmetric scales.
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        padding_idx: Optional[int] = None,
+        output_dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+        self.num_embeddings = int(weight.shape[0])
+        self.embedding_dim = int(weight.shape[1])
+        self.padding_idx = padding_idx
+        self.output_dtype = output_dtype
+        self.runtime_cache_persistent = False
+        emb_q, emb_s = self._q_per_row(weight)
+        self.register_buffer("emb_q", emb_q, persistent=True)
+        self.register_buffer("emb_s", emb_s, persistent=True)
+
+    @staticmethod
+    def _q_per_row(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        w = weight.float()
+        qmax = 127.0
+        s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / qmax
+        q = torch.round(w / s).clamp(-qmax, qmax).to(torch.int8)
+        return q.cpu(), s.squeeze(1).to(dtype=torch.float16).cpu()
+
+    def clear_runtime_cache(self):
+        return
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        dev = input_ids.device
+        flat = input_ids.reshape(-1)
+        q_rows = self.emb_q.to(device=dev).index_select(0, flat)
+        s_rows = self.emb_s.to(device=dev, dtype=torch.float32).index_select(0, flat)
+        out = q_rows.to(dtype=torch.float32) * s_rows.unsqueeze(1)
+        out = out.to(dtype=self.output_dtype)
+        return out.reshape(*input_ids.shape, self.embedding_dim)
+
+
 def apply_two_path_quantization(
     model: nn.Module,
     pairs: List[PairModules],
@@ -1893,6 +1935,43 @@ def apply_non_svd_int8_quantization(
 
 
 @torch.no_grad()
+def apply_embed_tokens_int8_quantization(
+    model: nn.Module,
+    include_names: Optional[List[str]] = None,
+) -> Dict[str, int]:
+    """
+    Quantize embedding modules named 'embed_tokens' (or custom names) to int8 weight-only.
+    """
+    include = include_names if include_names is not None else ["embed_tokens"]
+    replaced = 0
+    skipped = 0
+    total_embedding = 0
+    for path, mod in list(model.named_modules()):
+        if path == "" or not isinstance(mod, nn.Embedding):
+            continue
+        total_embedding += 1
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf not in include:
+            skipped += 1
+            continue
+        parent_path, name = _split_parent_and_name(path)
+        parent = _get_submodule(model, parent_path)
+        out_dtype = mod.weight.dtype if mod.weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float16
+        qmod = Int8Embedding(
+            weight=mod.weight.data,
+            padding_idx=mod.padding_idx,
+            output_dtype=out_dtype,
+        )
+        setattr(parent, name, qmod)
+        replaced += 1
+    return {
+        "total_embedding": total_embedding,
+        "replaced": replaced,
+        "skipped": skipped,
+    }
+
+
+@torch.no_grad()
 def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
     """
     Clear transient runtime caches in MP quantized modules so saved checkpoints
@@ -1901,7 +1980,7 @@ def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
     """
     cleared = 0
     for mod in model.modules():
-        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear)):
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear, Int8Embedding)):
             mod.clear_runtime_cache()
             cleared += 1
     return cleared
@@ -1916,7 +1995,7 @@ def set_mixed_precision_runtime_cache_policy(model: nn.Module, persistent: bool)
     """
     touched = 0
     for mod in model.modules():
-        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear)):
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear, Int8Embedding)):
             mod.runtime_cache_persistent = bool(persistent)
             if not persistent:
                 mod.clear_runtime_cache()

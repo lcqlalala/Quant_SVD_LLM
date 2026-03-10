@@ -25,9 +25,11 @@ def inspect_checkpoint(path: str) -> None:
             packed_n = sum(1 for k in sd.keys() if k.endswith("_packed4"))
             q_int8_n = sum(1 for k, v in sd.items() if k.endswith((".ul_q", ".vl_q")) and isinstance(v, torch.Tensor) and v.dtype == torch.int8)
             nonsvd_int8_n = sum(1 for k, v in sd.items() if k.endswith(".w_q") and isinstance(v, torch.Tensor) and v.dtype == torch.int8)
+            embed_int8_n = sum(1 for k, v in sd.items() if k.endswith(".emb_q") and isinstance(v, torch.Tensor) and v.dtype == torch.int8)
             print(f"packed4_tensors: {packed_n}")
             print(f"raw_lowbit_int8_tensors: {q_int8_n}")
             print(f"nonsvd_int8_tensors: {nonsvd_int8_n}")
+            print(f"embed_int8_tensors: {embed_int8_n}")
         if "packed_lowbit_q" in obj:
             print(f"packed_lowbit_q: {obj['packed_lowbit_q']}")
         if "packed_lowbit_q_stats" in obj:

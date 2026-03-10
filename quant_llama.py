@@ -15,6 +15,7 @@ from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
     apply_non_svd_int8_quantization,
+    apply_embed_tokens_int8_quantization,
     build_pair_whiten_inv,
     calibrate_component_sigma,
     clear_mixed_precision_runtime_cache,
@@ -518,6 +519,10 @@ if __name__ == '__main__':
         help='Exclude lm_head from non-SVD int8 quantization.'
     )
     parser.add_argument(
+        '--mp-quantize-embed-int8', action='store_true',
+        help='Quantize embed_tokens nn.Embedding to int8 weight-only.'
+    )
+    parser.add_argument(
         '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
         help='Checkpoint save format. auto -> state_dict when --mp-enable else full model object.'
     )
@@ -761,6 +766,15 @@ if __name__ == '__main__':
                 f"skipped={nonsvd_report['skipped']}, "
                 f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
             )
+        embed_report = None
+        if args.mp_quantize_embed_int8:
+            embed_report = apply_embed_tokens_int8_quantization(model=model)
+            print(
+                "Applied embed_tokens int8 quantization: "
+                f"replaced={embed_report['replaced']}, "
+                f"total_embedding={embed_report['total_embedding']}, "
+                f"skipped={embed_report['skipped']}"
+            )
         touched = set_mixed_precision_runtime_cache_policy(
             model=model,
             persistent=args.mp_persistent_runtime_cache,
@@ -815,6 +829,7 @@ if __name__ == '__main__':
                     "int4_quant_type": args.mp_int4_quant_type,
                     "quantize_nonsvd_int8": bool(args.mp_quantize_nonsvd_int8),
                     "nonsvd_int8_exclude_lm_head": bool(args.mp_nonsvd_int8_exclude_lm_head),
+                    "quantize_embed_int8": bool(args.mp_quantize_embed_int8),
                     "target_compression_ratio": float(args.mp_target_compression_ratio),
                     "allocation_report": alloc_report,
                 },

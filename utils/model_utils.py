@@ -298,6 +298,58 @@ def _install_non_svd_int8_modules_from_state_dict(
     return installed
 
 
+def _install_embed_int8_modules_from_state_dict(
+    model: nn.Module,
+    state_dict: dict,
+) -> int:
+    """
+    Install Int8Embedding modules saved as:
+      <module_path>.emb_q / <module_path>.emb_s
+    """
+    from utils.mixed_precision import Int8Embedding
+
+    prefixes = set()
+    for key in state_dict.keys():
+        if key.endswith(".emb_q"):
+            prefixes.add(key[: -len(".emb_q")])
+
+    installed = 0
+    for prefix in sorted(prefixes):
+        q_key = f"{prefix}.emb_q"
+        s_key = f"{prefix}.emb_s"
+        if q_key not in state_dict or s_key not in state_dict:
+            continue
+        q = state_dict[q_key]
+        s = state_dict[s_key]
+        if not isinstance(q, torch.Tensor) or not isinstance(s, torch.Tensor):
+            continue
+        if q.ndim != 2:
+            continue
+
+        if "." in prefix:
+            parent_path, name = prefix.rsplit(".", 1)
+        else:
+            parent_path, name = "", prefix
+        parent = _get_submodule_by_path(model, parent_path)
+        if not hasattr(parent, name):
+            continue
+        mod = getattr(parent, name)
+        if isinstance(mod, Int8Embedding):
+            continue
+        if not isinstance(mod, nn.Embedding):
+            continue
+
+        out_dtype = mod.weight.dtype if mod.weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float16
+        qmod = Int8Embedding(
+            weight=mod.weight.data,
+            padding_idx=mod.padding_idx,
+            output_dtype=out_dtype,
+        )
+        setattr(parent, name, qmod)
+        installed += 1
+    return installed
+
+
 def get_model_from_local(
     model_id: str,
     tokenizer_path: Optional[str] = None,
@@ -372,11 +424,14 @@ def get_model_from_local(
 
             installed = _install_mp_modules_from_state_dict(model, state_dict, obj.get("mp_config", None))
             installed_non_svd = _install_non_svd_int8_modules_from_state_dict(model, state_dict, obj.get("mp_config", None))
+            installed_embed = _install_embed_int8_modules_from_state_dict(model, state_dict)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if installed > 0:
                 print(f"Installed MP modules from checkpoint: {installed}")
             if installed_non_svd > 0:
                 print(f"Installed non-SVD int8 modules from checkpoint: {installed_non_svd}")
+            if installed_embed > 0:
+                print(f"Installed embedding int8 modules from checkpoint: {installed_embed}")
             if len(unexpected) > 0:
                 print(f"Warning: unexpected keys while loading state_dict: {len(unexpected)}")
             if len(missing) > 0:
