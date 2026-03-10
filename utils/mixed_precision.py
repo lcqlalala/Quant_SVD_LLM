@@ -1694,6 +1694,90 @@ class TwoPathSigmaLowRankLinear(nn.Module):
         return out
 
 
+class Int8WeightLinear(nn.Module):
+    """
+    Int8 weight-only linear with per-row symmetric scales and dynamic int8 activations.
+    """
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_int8_kernel: bool = True,
+    ):
+        super().__init__()
+        self.use_int8_kernel = use_int8_kernel
+        self.runtime_cache_persistent = False
+        self.out_features = int(weight.shape[0])
+        self.in_features = int(weight.shape[1])
+        w_q, w_s = self._q_per_row(weight)
+        self.register_buffer("w_q", w_q, persistent=True)
+        self.register_buffer("w_s", w_s, persistent=True)
+        if bias is None:
+            self.register_buffer("bias", None, persistent=True)
+        else:
+            self.register_buffer("bias", bias.detach().clone().to(dtype=torch.float16), persistent=True)
+
+        self._runtime_wq_t: Optional[torch.Tensor] = None
+        self._runtime_ws: Optional[torch.Tensor] = None
+        self._runtime_w: Optional[torch.Tensor] = None
+        self._runtime_device: Optional[torch.device] = None
+        self._runtime_dtype: Optional[torch.dtype] = None
+
+    @staticmethod
+    def _q_per_row(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        w = weight.float()
+        qmax = 127.0
+        s = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / qmax
+        q = torch.round(w / s).clamp(-qmax, qmax).to(torch.int8)
+        return q.cpu(), s.squeeze(1).to(dtype=torch.float16).cpu()
+
+    def _build_runtime_cache(self, device: torch.device, dtype: torch.dtype):
+        if (
+            self._runtime_wq_t is not None
+            and self._runtime_ws is not None
+            and self._runtime_device == device
+            and self._runtime_dtype == dtype
+        ):
+            return
+        self._runtime_wq_t = self.w_q.to(device=device).transpose(0, 1).contiguous()
+        self._runtime_ws = self.w_s.to(device=device, dtype=torch.float32)
+        self._runtime_w = None
+        if not _can_use_int8_gemm(device, self.use_int8_kernel):
+            w = self.w_q.to(device=device, dtype=torch.float32)
+            s = self.w_s.to(device=device, dtype=torch.float32).unsqueeze(1)
+            self._runtime_w = (w * s).to(dtype=dtype)
+        self._runtime_device = device
+        self._runtime_dtype = dtype
+
+    def clear_runtime_cache(self):
+        self._runtime_wq_t = None
+        self._runtime_ws = None
+        self._runtime_w = None
+        self._runtime_device = None
+        self._runtime_dtype = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dev = x.device
+        dtype = x.dtype
+        self._build_runtime_cache(dev, dtype)
+        x2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if _can_use_int8_gemm(dev, self.use_int8_kernel) and self._runtime_wq_t is not None and self._runtime_ws is not None:
+            out2d = _int8_linear_dynamic_act(x2d, self._runtime_wq_t, self._runtime_ws).to(dtype=dtype)
+        else:
+            if self._runtime_w is None:
+                w = self.w_q.to(device=dev, dtype=torch.float32)
+                s = self.w_s.to(device=dev, dtype=torch.float32).unsqueeze(1)
+                self._runtime_w = (w * s).to(dtype=dtype)
+            out2d = F.linear(x2d.to(dtype=self._runtime_w.dtype), self._runtime_w)
+        out = out2d.reshape(*x.shape[:-1], self.out_features)
+        if self.bias is not None:
+            out = out + self.bias.to(device=dev, dtype=dtype)
+        if not self.runtime_cache_persistent:
+            self.clear_runtime_cache()
+        return out
+
+
 def apply_two_path_quantization(
     model: nn.Module,
     pairs: List[PairModules],
@@ -1755,6 +1839,60 @@ def apply_two_path_quantization(
 
 
 @torch.no_grad()
+def apply_non_svd_int8_quantization(
+    model: nn.Module,
+    pairs: List[PairModules],
+    use_int8_kernel: bool = True,
+    exclude_lm_head: bool = False,
+) -> Dict[str, int]:
+    """
+    Quantize non-SVD nn.Linear modules to int8 weight-only.
+    Excludes all *_u_proj/*_v_proj pair modules tracked by `pairs`.
+    """
+    excluded_ids = set()
+    for pair in pairs:
+        excluded_ids.add(id(pair.u_module))
+        excluded_ids.add(id(pair.v_module))
+
+    replaced = 0
+    skipped = 0
+    total_linear = 0
+    named = list(model.named_modules())
+    for path, mod in named:
+        if path == "" or not isinstance(mod, nn.Linear):
+            continue
+        total_linear += 1
+        if id(mod) in excluded_ids:
+            skipped += 1
+            continue
+        if path.endswith("_u_proj") or path.endswith("_v_proj"):
+            skipped += 1
+            continue
+        if path.endswith("_mp_proj"):
+            skipped += 1
+            continue
+        if exclude_lm_head and path == "lm_head":
+            skipped += 1
+            continue
+        parent_path, name = _split_parent_and_name(path)
+        parent = _get_submodule(model, parent_path)
+        bias = mod.bias.data if mod.bias is not None else None
+        qmod = Int8WeightLinear(
+            weight=mod.weight.data,
+            bias=bias,
+            use_int8_kernel=use_int8_kernel,
+        )
+        setattr(parent, name, qmod)
+        replaced += 1
+
+    return {
+        "total_linear": total_linear,
+        "replaced": replaced,
+        "skipped": skipped,
+    }
+
+
+@torch.no_grad()
 def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
     """
     Clear transient runtime caches in MP quantized modules so saved checkpoints
@@ -1763,7 +1901,7 @@ def clear_mixed_precision_runtime_cache(model: nn.Module) -> int:
     """
     cleared = 0
     for mod in model.modules():
-        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear)):
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear)):
             mod.clear_runtime_cache()
             cleared += 1
     return cleared
@@ -1778,7 +1916,7 @@ def set_mixed_precision_runtime_cache_policy(model: nn.Module, persistent: bool)
     """
     touched = 0
     for mod in model.modules():
-        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear)):
+        if isinstance(mod, (TwoPathLowRankLinear, TwoPathSigmaLowRankLinear, Int8WeightLinear)):
             mod.runtime_cache_persistent = bool(persistent)
             if not persistent:
                 mod.clear_runtime_cache()

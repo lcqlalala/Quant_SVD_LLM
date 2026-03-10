@@ -14,6 +14,7 @@ from gptq.quant import *
 from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
+    apply_non_svd_int8_quantization,
     build_pair_whiten_inv,
     calibrate_component_sigma,
     clear_mixed_precision_runtime_cache,
@@ -509,6 +510,14 @@ if __name__ == '__main__':
         help='Keep MP runtime caches across calls for speed (uses much more GPU memory).'
     )
     parser.add_argument(
+        '--mp-quantize-nonsvd-int8', action='store_true',
+        help='Additionally quantize non-SVD nn.Linear modules (e.g., lm_head) with int8 weight-only quantization.'
+    )
+    parser.add_argument(
+        '--mp-nonsvd-int8-exclude-lm-head', action='store_true',
+        help='Exclude lm_head from non-SVD int8 quantization.'
+    )
+    parser.add_argument(
         '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
         help='Checkpoint save format. auto -> state_dict when --mp-enable else full model object.'
     )
@@ -737,6 +746,21 @@ if __name__ == '__main__':
             use_int4_kernel=args.mp_enable_int4_kernel,
             int4_quant_type=args.mp_int4_quant_type,
         )
+        nonsvd_report = None
+        if args.mp_quantize_nonsvd_int8:
+            nonsvd_report = apply_non_svd_int8_quantization(
+                model=model,
+                pairs=pairs,
+                use_int8_kernel=not args.mp_disable_int8_kernel,
+                exclude_lm_head=args.mp_nonsvd_int8_exclude_lm_head,
+            )
+            print(
+                "Applied non-SVD int8 quantization: "
+                f"replaced={nonsvd_report['replaced']}, "
+                f"total_linear={nonsvd_report['total_linear']}, "
+                f"skipped={nonsvd_report['skipped']}, "
+                f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
+            )
         touched = set_mixed_precision_runtime_cache_policy(
             model=model,
             persistent=args.mp_persistent_runtime_cache,
@@ -789,6 +813,8 @@ if __name__ == '__main__':
                     "use_int8_kernel": bool(not args.mp_disable_int8_kernel),
                     "use_int4_kernel": bool(args.mp_enable_int4_kernel),
                     "int4_quant_type": args.mp_int4_quant_type,
+                    "quantize_nonsvd_int8": bool(args.mp_quantize_nonsvd_int8),
+                    "nonsvd_int8_exclude_lm_head": bool(args.mp_nonsvd_int8_exclude_lm_head),
                     "target_compression_ratio": float(args.mp_target_compression_ratio),
                     "allocation_report": alloc_report,
                 },

@@ -241,6 +241,63 @@ def _install_mp_modules_from_state_dict(
     return installed
 
 
+def _install_non_svd_int8_modules_from_state_dict(
+    model: nn.Module,
+    state_dict: dict,
+    mp_config: Optional[dict] = None,
+) -> int:
+    """
+    Install Int8WeightLinear modules for non-SVD linears saved as:
+      <module_path>.w_q / <module_path>.w_s
+    """
+    from utils.mixed_precision import Int8WeightLinear
+
+    use_int8_kernel = True
+    if isinstance(mp_config, dict):
+        use_int8_kernel = bool(mp_config.get("use_int8_kernel", True))
+
+    prefixes = set()
+    for key in state_dict.keys():
+        if key.endswith(".w_q"):
+            prefixes.add(key[: -len(".w_q")])
+
+    installed = 0
+    for prefix in sorted(prefixes):
+        q_key = f"{prefix}.w_q"
+        s_key = f"{prefix}.w_s"
+        if q_key not in state_dict or s_key not in state_dict:
+            continue
+        q = state_dict[q_key]
+        s = state_dict[s_key]
+        if not isinstance(q, torch.Tensor) or not isinstance(s, torch.Tensor):
+            continue
+        if q.ndim != 2:
+            continue
+
+        if "." in prefix:
+            parent_path, name = prefix.rsplit(".", 1)
+        else:
+            parent_path, name = "", prefix
+        parent = _get_submodule_by_path(model, parent_path)
+        if not hasattr(parent, name):
+            continue
+        mod = getattr(parent, name)
+        if isinstance(mod, Int8WeightLinear):
+            continue
+        if not isinstance(mod, nn.Linear):
+            continue
+
+        bias = mod.bias.data if mod.bias is not None else None
+        qmod = Int8WeightLinear(
+            weight=mod.weight.data,
+            bias=bias,
+            use_int8_kernel=use_int8_kernel,
+        )
+        setattr(parent, name, qmod)
+        installed += 1
+    return installed
+
+
 def get_model_from_local(
     model_id: str,
     tokenizer_path: Optional[str] = None,
@@ -314,9 +371,12 @@ def get_model_from_local(
                     )
 
             installed = _install_mp_modules_from_state_dict(model, state_dict, obj.get("mp_config", None))
+            installed_non_svd = _install_non_svd_int8_modules_from_state_dict(model, state_dict, obj.get("mp_config", None))
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if installed > 0:
                 print(f"Installed MP modules from checkpoint: {installed}")
+            if installed_non_svd > 0:
+                print(f"Installed non-SVD int8 modules from checkpoint: {installed_non_svd}")
             if len(unexpected) > 0:
                 print(f"Warning: unexpected keys while loading state_dict: {len(unexpected)}")
             if len(missing) > 0:
