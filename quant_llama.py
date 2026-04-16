@@ -28,8 +28,12 @@ from utils.mixed_precision import (
     discover_low_rank_pairs,
     solve_budgeted_topk,
     solve_budgeted_topk_quadratic,
+    solve_budgeted_multilevel_quadratic,
     set_mixed_precision_runtime_cache_policy,
     strip_original_low_rank_weights,
+    MP_STATE_DROP,
+    MP_STATE_LOW,
+    MP_STATE_HIGH,
 )
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -318,23 +322,34 @@ def report_mixed_precision_allocation(
     alloc,
     high_bit: float,
     low_bit: float,
+    drop_bit: float = 0.0,
     base_bits: float = None,
 ):
     total = 0
     high = 0
+    low = 0
+    drop = 0
     for p in pairs:
         if p.key not in alloc:
             continue
         mask = alloc[p.key]
-        total += int(mask.numel())
-        high += int(mask.sum().item())
-    low = total - high
+        if isinstance(mask, torch.Tensor) and mask.dtype == torch.bool:
+            total += int(mask.numel())
+            high += int(mask.sum().item())
+            low += int(mask.numel() - mask.sum().item())
+        else:
+            state = mask.to(dtype=torch.uint8)
+            total += int(state.numel())
+            high += int((state == MP_STATE_HIGH).sum().item())
+            low += int((state == MP_STATE_LOW).sum().item())
+            drop += int((state == MP_STATE_DROP).sum().item())
     avg_bits = 0.0
     if total > 0:
         high_bits = float(high_bit)
         low_bits = float(low_bit)
-        avg_bits = (high * high_bits + low * low_bits) / float(total)
-    msg = f"Mixed-precision allocation: high={high}, low={low}, total={total}, avg_bits={avg_bits:.4f}"
+        drop_bits = float(drop_bit) if drop > 0 else 0.0
+        avg_bits = (high * high_bits + low * low_bits + drop * drop_bits) / float(total)
+    msg = f"Mixed-precision allocation: high={high}, low={low}, drop={drop}, total={total}, avg_bits={avg_bits:.4f}"
     if base_bits is not None and avg_bits > 0:
         est_ratio = float(base_bits) / avg_bits
         msg += f", est_lowrank_compression_ratio={est_ratio:.4f}x"
@@ -342,6 +357,7 @@ def report_mixed_precision_allocation(
     return {
         "high": high,
         "low": low,
+        "drop": drop,
         "total": total,
         "avg_bits": avg_bits,
     }
@@ -490,6 +506,18 @@ if __name__ == '__main__':
         help='Target average bit-width under budgeted top-k selection.'
     )
     parser.add_argument(
+        '--mp-enable-drop', action='store_true',
+        help='Enable joint truncation+quantization allocation with drop/low/high component states.'
+    )
+    parser.add_argument(
+        '--mp-drop-bit', type=float, default=0.0,
+        help='Bit-cost assigned to dropped components in budget accounting (typically 0).'
+    )
+    parser.add_argument(
+        '--mp-min-keep-ratio', type=float, default=0.02,
+        help='Minimum per-pair keep ratio (drop->low bootstrap) when joint drop allocation is enabled.'
+    )
+    parser.add_argument(
         '--mp-target-compression-ratio', type=float, default=0.0,
         help='If >0, auto-set mp_avg_bit from target low-rank compression ratio. '
              'Computed as mp_avg_bit = base_weight_bits / ratio, then clamped to [mp-low-bit, mp-high-bit].'
@@ -550,12 +578,13 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     base_weight_bits = _base_weight_bits_from_dtype(args.model_dtype)
+    budget_min_bit = float(args.mp_drop_bit) if args.mp_enable_drop else float(args.mp_low_bit)
     if args.mp_target_compression_ratio is not None and args.mp_target_compression_ratio > 0:
         target_avg = base_weight_bits / float(args.mp_target_compression_ratio)
-        clamped_avg = min(float(args.mp_high_bit), max(float(args.mp_low_bit), target_avg))
+        clamped_avg = min(float(args.mp_high_bit), max(budget_min_bit, target_avg))
         if abs(clamped_avg - target_avg) > 1e-8:
             print(
-                "Warning: target compression ratio implies avg bit outside [low, high]. "
+                "Warning: target compression ratio implies avg bit outside [min, high]. "
                 f"target_avg_bit={target_avg:.4f}, clamped={clamped_avg:.4f}"
             )
         args.mp_avg_bit = clamped_avg
@@ -618,6 +647,8 @@ if __name__ == '__main__':
     pairs = None
     alloc_report = None
     if args.mp_enable:
+        if args.mp_enable_drop and args.mp_kfac_mode != "sigma_full":
+            raise ValueError("--mp-enable-drop currently requires --mp-kfac-mode sigma_full")
         mp_stages = ["discover_pairs"]
         if args.mp_sigma_mode == "calibrated":
             mp_stages.append("sigma_calibration")
@@ -720,15 +751,28 @@ if __name__ == '__main__':
                 sigma_eps=args.mp_sigma_eps,
             )
             fisher_sigma = compute_sigma_fisher_full(pairs, stats)
-            alloc = solve_budgeted_topk_quadratic(
-                pairs=pairs,
-                fisher_sigma=fisher_sigma,
-                low_bit=args.mp_low_bit,
-                high_bit=args.mp_high_bit,
-                avg_bit=args.mp_avg_bit,
-                sigma_calib=sigma_calib,
-                sigma_eps=args.mp_sigma_eps,
-            )
+            if args.mp_enable_drop:
+                alloc = solve_budgeted_multilevel_quadratic(
+                    pairs=pairs,
+                    fisher_sigma=fisher_sigma,
+                    low_bit=args.mp_low_bit,
+                    high_bit=args.mp_high_bit,
+                    avg_bit=args.mp_avg_bit,
+                    sigma_calib=sigma_calib,
+                    sigma_eps=args.mp_sigma_eps,
+                    drop_bit=args.mp_drop_bit,
+                    min_keep_ratio=args.mp_min_keep_ratio,
+                )
+            else:
+                alloc = solve_budgeted_topk_quadratic(
+                    pairs=pairs,
+                    fisher_sigma=fisher_sigma,
+                    low_bit=args.mp_low_bit,
+                    high_bit=args.mp_high_bit,
+                    avg_bit=args.mp_avg_bit,
+                    sigma_calib=sigma_calib,
+                    sigma_eps=args.mp_sigma_eps,
+                )
         finish_stage("kfac_stats")
         finish_stage("allocation")
 
@@ -737,6 +781,7 @@ if __name__ == '__main__':
             alloc,
             high_bit=args.mp_high_bit,
             low_bit=args.mp_low_bit,
+            drop_bit=args.mp_drop_bit,
             base_bits=base_weight_bits,
         )
         apply_two_path_quantization(
@@ -831,6 +876,9 @@ if __name__ == '__main__':
                     "nonsvd_int8_exclude_lm_head": bool(args.mp_nonsvd_int8_exclude_lm_head),
                     "quantize_embed_int8": bool(args.mp_quantize_embed_int8),
                     "target_compression_ratio": float(args.mp_target_compression_ratio),
+                    "enable_drop": bool(args.mp_enable_drop),
+                    "drop_bit": float(args.mp_drop_bit),
+                    "min_keep_ratio": float(args.mp_min_keep_ratio),
                     "allocation_report": alloc_report,
                 },
                 "packed_lowbit_q": True,

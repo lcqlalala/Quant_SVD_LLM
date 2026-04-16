@@ -12,6 +12,10 @@ try:
 except Exception:
     bnb = None
 
+MP_STATE_DROP = 0
+MP_STATE_LOW = 1
+MP_STATE_HIGH = 2
+
 
 @dataclass
 class PairModules:
@@ -815,6 +819,258 @@ def solve_budgeted_topk_quadratic(
 
     for key, st in states.items():
         alloc[key] = st["mask"].clone()  # type: ignore[assignment]
+    return alloc
+
+
+def solve_budgeted_multilevel_quadratic(
+    pairs: List[PairModules],
+    fisher_sigma: Dict[str, torch.Tensor],
+    low_bit: int = 4,
+    high_bit: int = 8,
+    avg_bit: float = 4.5,
+    sigma_calib: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+    sigma_eps: float = 1e-12,
+    drop_bit: float = 0.0,
+    min_keep_ratio: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """
+    Unified drop/low/high allocation with sigma-space quadratic objective.
+    State semantics per component:
+      drop -> deterministic perturbation delta_sigma = -sigma
+      low/high -> zero-mean quantization perturbation with variance proxy
+    Objective approximates expected loss:
+      E[Delta L] = 1/2 * d^T F d + 1/2 * sum_i F_ii * var_i
+    where d is deterministic perturbation vector.
+    """
+    if high_bit <= low_bit:
+        raise ValueError("high_bit must be larger than low_bit")
+    if drop_bit < 0:
+        raise ValueError("drop_bit must be non-negative")
+    if not (0.0 <= min_keep_ratio <= 1.0):
+        raise ValueError("min_keep_ratio must be in [0, 1]")
+
+    target_avg = min(max(avg_bit, float(drop_bit)), float(high_bit))
+    states: Dict[str, Dict[str, object]] = {}
+    alloc: Dict[str, torch.Tensor] = {}
+    total_params = 0.0
+    used = 0.0
+    noise_low = _quant_noise_proxy(low_bit)
+    noise_high = _quant_noise_proxy(high_bit)
+
+    for pair in pairs:
+        out_dim, rank = pair.u_module.weight.shape
+        _, in_dim = pair.v_module.weight.shape
+        params_per_component = float(out_dim + in_dim)
+        alloc[pair.key] = torch.full((rank,), MP_STATE_DROP, dtype=torch.uint8)
+
+        if pair.key not in fisher_sigma:
+            continue
+        F = fisher_sigma[pair.key].float().cpu()
+        if F.shape != (rank, rank):
+            continue
+        sigma_vec = _estimate_sigma_proxy(pair).float().cpu()
+        active = sigma_vec > sigma_eps
+        active_count = int(active.sum().item())
+        if active_count == 0:
+            continue
+        total_params += params_per_component * float(active_count)
+
+        if sigma_calib is not None and pair.key in sigma_calib:
+            low_noise = sigma_calib[pair.key]["low"].float().clamp_min(0.0).cpu()
+            high_noise = sigma_calib[pair.key]["high"].float().clamp_min(0.0).cpu()
+        else:
+            low_noise = torch.full((rank,), noise_low, dtype=torch.float32)
+            high_noise = torch.full((rank,), noise_high, dtype=torch.float32)
+
+        F = 0.5 * (F + F.transpose(0, 1))
+        diag = torch.diag(F)
+        d = torch.zeros(rank, dtype=torch.float32)
+        d[active] = -sigma_vec[active]
+        Fd = F.matmul(d)
+
+        low_var = (sigma_vec * sigma_vec) * low_noise
+        high_var = (sigma_vec * sigma_vec) * high_noise
+        low_var = torch.where(active, low_var, torch.zeros_like(low_var))
+        high_var = torch.where(active, high_var, torch.zeros_like(high_var))
+        var = torch.zeros(rank, dtype=torch.float32)
+        state = torch.full((rank,), MP_STATE_DROP, dtype=torch.uint8)
+
+        states[pair.key] = {
+            "F": F,
+            "diag": diag,
+            "d": d,
+            "Fd": Fd,
+            "var": var,
+            "low_var": low_var,
+            "high_var": high_var,
+            "state": state,
+            "sigma": sigma_vec,
+            "active": active,
+            "params_per_component": params_per_component,
+            "cost_drop": params_per_component * float(drop_bit),
+            "cost_low": params_per_component * float(low_bit),
+            "cost_high": params_per_component * float(high_bit),
+        }
+
+    extra_budget = total_params * (target_avg - float(drop_bit))
+
+    def _apply_action(st: Dict[str, object], idx: int, to_state: int) -> float:
+        cur = int(st["state"][idx].item())  # type: ignore[index]
+        if cur == to_state:
+            return 0.0
+        delta_d = 0.0
+        delta_var = 0.0
+        sigma_i = float(st["sigma"][idx].item())  # type: ignore[index]
+        low_var_i = float(st["low_var"][idx].item())  # type: ignore[index]
+        high_var_i = float(st["high_var"][idx].item())  # type: ignore[index]
+        diag_i = float(st["diag"][idx].item())  # type: ignore[index]
+        Fd_i = float(st["Fd"][idx].item())  # type: ignore[index]
+        cost_drop = float(st["cost_drop"])
+        cost_low = float(st["cost_low"])
+        cost_high = float(st["cost_high"])
+
+        if cur == MP_STATE_DROP and to_state == MP_STATE_LOW:
+            delta_d = sigma_i
+            delta_var = low_var_i
+            delta_cost = cost_low - cost_drop
+        elif cur == MP_STATE_DROP and to_state == MP_STATE_HIGH:
+            delta_d = sigma_i
+            delta_var = high_var_i
+            delta_cost = cost_high - cost_drop
+        elif cur == MP_STATE_LOW and to_state == MP_STATE_HIGH:
+            delta_var = high_var_i - low_var_i
+            delta_cost = cost_high - cost_low
+        else:
+            return 0.0
+
+        if abs(delta_d) > 0:
+            st["d"][idx] += delta_d  # type: ignore[index]
+            st["Fd"] += st["F"][:, idx] * delta_d  # type: ignore[index]
+        if abs(delta_var) > 0:
+            st["var"][idx] += delta_var  # type: ignore[index]
+        st["state"][idx] = to_state  # type: ignore[index]
+        return float(delta_cost)
+
+    def _action_gain_density(st: Dict[str, object], idx: int, to_state: int) -> Tuple[float, float]:
+        cur = int(st["state"][idx].item())  # type: ignore[index]
+        if cur == to_state:
+            return 0.0, 0.0
+        sigma_i = float(st["sigma"][idx].item())  # type: ignore[index]
+        low_var_i = float(st["low_var"][idx].item())  # type: ignore[index]
+        high_var_i = float(st["high_var"][idx].item())  # type: ignore[index]
+        diag_i = float(st["diag"][idx].item())  # type: ignore[index]
+        Fd_i = float(st["Fd"][idx].item())  # type: ignore[index]
+        cost_drop = float(st["cost_drop"])
+        cost_low = float(st["cost_low"])
+        cost_high = float(st["cost_high"])
+
+        delta_d = 0.0
+        delta_var = 0.0
+        delta_cost = 0.0
+        if cur == MP_STATE_DROP and to_state == MP_STATE_LOW:
+            delta_d = sigma_i
+            delta_var = low_var_i
+            delta_cost = cost_low - cost_drop
+        elif cur == MP_STATE_DROP and to_state == MP_STATE_HIGH:
+            delta_d = sigma_i
+            delta_var = high_var_i
+            delta_cost = cost_high - cost_drop
+        elif cur == MP_STATE_LOW and to_state == MP_STATE_HIGH:
+            delta_var = high_var_i - low_var_i
+            delta_cost = cost_high - cost_low
+        else:
+            return 0.0, 0.0
+
+        if delta_cost <= 0:
+            return 0.0, 0.0
+        delta_L_det = delta_d * Fd_i + 0.5 * (delta_d * delta_d) * diag_i
+        delta_L_var = 0.5 * delta_var * diag_i
+        gain = -(delta_L_det + delta_L_var)
+        if gain <= 0.0:
+            return gain, 0.0
+        return gain, gain / delta_cost
+
+    if min_keep_ratio > 0.0:
+        for key, st in states.items():
+            active = st["active"]  # type: ignore[assignment]
+            active_idx = torch.where(active)[0]
+            if active_idx.numel() == 0:
+                continue
+            keep_count = int(math.ceil(float(active_idx.numel()) * min_keep_ratio))
+            if keep_count <= 0:
+                continue
+            sigma_vec = st["sigma"]  # type: ignore[assignment]
+            diag = st["diag"]  # type: ignore[assignment]
+            keep_score = (sigma_vec * sigma_vec) * diag
+            keep_score = keep_score.clone()
+            keep_score[~active] = -float("inf")
+            topk = min(keep_count, int(active_idx.numel()))
+            chosen = torch.topk(keep_score, k=topk, largest=True).indices
+            for idx_t in chosen:
+                idx = int(idx_t.item())
+                if int(st["state"][idx].item()) != MP_STATE_DROP:  # type: ignore[index]
+                    continue
+                used += _apply_action(st, idx, MP_STATE_LOW)
+
+    if used > extra_budget + 1e-9:
+        print(
+            "Warning: min_keep_ratio bootstrap exceeds target budget; "
+            f"used_bits={used:.2f}, budget_bits={extra_budget:.2f}"
+        )
+
+    while True:
+        best_key = None
+        best_idx = -1
+        best_to_state = MP_STATE_DROP
+        best_gain = 0.0
+        best_density = 0.0
+        best_cost = 0.0
+
+        for key, st in states.items():
+            active = st["active"]  # type: ignore[assignment]
+            cand_idx = torch.where(active)[0]
+            if cand_idx.numel() == 0:
+                continue
+            for idx_t in cand_idx:
+                idx = int(idx_t.item())
+                cur = int(st["state"][idx].item())  # type: ignore[index]
+                transitions = []
+                if cur == MP_STATE_DROP:
+                    transitions = [MP_STATE_LOW, MP_STATE_HIGH]
+                elif cur == MP_STATE_LOW:
+                    transitions = [MP_STATE_HIGH]
+                for to_state in transitions:
+                    gain, density = _action_gain_density(st, idx, to_state)
+                    if gain <= 0.0 or density <= 0.0:
+                        continue
+                    cost_drop = float(st["cost_drop"])
+                    cost_low = float(st["cost_low"])
+                    cost_high = float(st["cost_high"])
+                    if cur == MP_STATE_DROP and to_state == MP_STATE_LOW:
+                        delta_cost = cost_low - cost_drop
+                    elif cur == MP_STATE_DROP and to_state == MP_STATE_HIGH:
+                        delta_cost = cost_high - cost_drop
+                    else:
+                        delta_cost = cost_high - cost_low
+                    if used + delta_cost > extra_budget + 1e-9:
+                        continue
+                    if density > best_density:
+                        best_density = density
+                        best_gain = gain
+                        best_key = key
+                        best_idx = idx
+                        best_to_state = to_state
+                        best_cost = delta_cost
+
+        if best_key is None or best_idx < 0 or best_gain <= 0.0:
+            break
+        st = states[best_key]
+        used += _apply_action(st, best_idx, best_to_state)
+        if best_cost <= 0.0:
+            break
+
+    for key, st in states.items():
+        alloc[key] = st["state"].clone()  # type: ignore[assignment]
     return alloc
 
 
@@ -1837,12 +2093,18 @@ def apply_two_path_quantization(
     for pair in pairs:
         if pair.key not in alloc:
             continue
-        high_mask = alloc[pair.key]
-        rank = high_mask.numel()
-        high_idx = torch.where(high_mask)[0]
-        low_idx = torch.where(~high_mask)[0]
-        if high_idx.numel() == 0 and low_idx.numel() == 0 and rank > 0:
-            low_idx = torch.arange(rank)
+        alloc_entry = alloc[pair.key]
+        if alloc_entry.dtype == torch.bool:
+            high_mask = alloc_entry
+            rank = high_mask.numel()
+            high_idx = torch.where(high_mask)[0]
+            low_idx = torch.where(~high_mask)[0]
+            if high_idx.numel() == 0 and low_idx.numel() == 0 and rank > 0:
+                low_idx = torch.arange(rank)
+        else:
+            states = alloc_entry.to(dtype=torch.uint8)
+            high_idx = torch.where(states == MP_STATE_HIGH)[0]
+            low_idx = torch.where(states == MP_STATE_LOW)[0]
 
         if explicit_sigma:
             u_basis, sigma_vec, v_basis, _ = _decompose_uv_to_explicit_sigma(
