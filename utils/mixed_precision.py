@@ -998,44 +998,91 @@ def solve_budgeted_multilevel_quadratic(
         st["state"][idx] = to_state  # type: ignore[index]
         return float(delta_cost)
 
-    def _action_gain_density(st: Dict[str, object], idx: int, to_state: int) -> Tuple[float, float]:
-        cur = int(st["state"][idx].item())  # type: ignore[index]
-        if cur == to_state:
-            return 0.0, 0.0
-        sigma_i = float(st["sigma"][idx].item())  # type: ignore[index]
-        low_var_i = float(st["low_var"][idx].item())  # type: ignore[index]
-        high_var_i = float(st["high_var"][idx].item())  # type: ignore[index]
-        diag_i = float(st["diag"][idx].item())  # type: ignore[index]
-        Fd_i = float(st["Fd"][idx].item())  # type: ignore[index]
+    def _best_action_for_state(
+        st: Dict[str, object], remain_budget: float
+    ) -> Optional[Tuple[int, int, float, float, float]]:
+        """
+        Return best feasible action as:
+          (idx, to_state, gain, density, delta_cost)
+        Vectorized over all components in this pair.
+        """
+        if remain_budget <= 0.0:
+            return None
+        eps_budget = 1e-9
+        active = st["active"]  # type: ignore[assignment]
+        state = st["state"]  # type: ignore[assignment]
+        sigma = st["sigma"]  # type: ignore[assignment]
+        low_var = st["low_var"]  # type: ignore[assignment]
+        high_var = st["high_var"]  # type: ignore[assignment]
+        diag = st["diag"]  # type: ignore[assignment]
+        Fd = st["Fd"]  # type: ignore[assignment]
         cost_drop = float(st["cost_drop"])
         cost_low = float(st["cost_low"])
         cost_high = float(st["cost_high"])
 
-        delta_d = 0.0
-        delta_var = 0.0
-        delta_cost = 0.0
-        if cur == MP_STATE_DROP and to_state == MP_STATE_LOW:
-            delta_d = sigma_i
-            delta_var = low_var_i
-            delta_cost = cost_low - cost_drop
-        elif cur == MP_STATE_DROP and to_state == MP_STATE_HIGH:
-            delta_d = sigma_i
-            delta_var = high_var_i
-            delta_cost = cost_high - cost_drop
-        elif cur == MP_STATE_LOW and to_state == MP_STATE_HIGH:
-            delta_var = high_var_i - low_var_i
-            delta_cost = cost_high - cost_low
-        else:
-            return 0.0, 0.0
+        inf_neg = torch.tensor(-float("inf"), dtype=torch.float32)
+        best_idx = -1
+        best_to_state = MP_STATE_DROP
+        best_gain = 0.0
+        best_density = 0.0
+        best_cost = 0.0
 
-        if delta_cost <= 0:
-            return 0.0, 0.0
-        delta_L_det = delta_d * Fd_i + 0.5 * (delta_d * delta_d) * diag_i
-        delta_L_var = 0.5 * delta_var * diag_i
-        gain = -(delta_L_det + delta_L_var)
-        if gain <= 0.0:
-            return gain, 0.0
-        return gain, gain / delta_cost
+        # Drop -> Low
+        cost_dl = cost_low - cost_drop
+        if cost_dl > 0.0 and cost_dl <= remain_budget + eps_budget:
+            mask_dl = active & (state == MP_STATE_DROP)
+            if torch.any(mask_dl):
+                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var)
+                gain_dl = torch.where(mask_dl, gain_dl, inf_neg)
+                max_gain_dl, idx_dl = torch.max(gain_dl, dim=0)
+                gain_val = float(max_gain_dl.item())
+                if gain_val > 0.0:
+                    density = gain_val / cost_dl
+                    best_idx = int(idx_dl.item())
+                    best_to_state = MP_STATE_LOW
+                    best_gain = gain_val
+                    best_density = density
+                    best_cost = cost_dl
+
+        # Drop -> High
+        cost_dh = cost_high - cost_drop
+        if cost_dh > 0.0 and cost_dh <= remain_budget + eps_budget:
+            mask_dh = active & (state == MP_STATE_DROP)
+            if torch.any(mask_dh):
+                gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var)
+                gain_dh = torch.where(mask_dh, gain_dh, inf_neg)
+                max_gain_dh, idx_dh = torch.max(gain_dh, dim=0)
+                gain_val = float(max_gain_dh.item())
+                if gain_val > 0.0:
+                    density = gain_val / cost_dh
+                    if density > best_density:
+                        best_idx = int(idx_dh.item())
+                        best_to_state = MP_STATE_HIGH
+                        best_gain = gain_val
+                        best_density = density
+                        best_cost = cost_dh
+
+        # Low -> High
+        cost_lh = cost_high - cost_low
+        if cost_lh > 0.0 and cost_lh <= remain_budget + eps_budget:
+            mask_lh = active & (state == MP_STATE_LOW)
+            if torch.any(mask_lh):
+                gain_lh = -(0.5 * (high_var - low_var) * diag)
+                gain_lh = torch.where(mask_lh, gain_lh, inf_neg)
+                max_gain_lh, idx_lh = torch.max(gain_lh, dim=0)
+                gain_val = float(max_gain_lh.item())
+                if gain_val > 0.0:
+                    density = gain_val / cost_lh
+                    if density > best_density:
+                        best_idx = int(idx_lh.item())
+                        best_to_state = MP_STATE_HIGH
+                        best_gain = gain_val
+                        best_density = density
+                        best_cost = cost_lh
+
+        if best_idx < 0 or best_gain <= 0.0 or best_density <= 0.0:
+            return None
+        return best_idx, best_to_state, best_gain, best_density, best_cost
 
     if min_keep_ratio > 0.0:
         for key, st in states.items():
@@ -1065,56 +1112,54 @@ def solve_budgeted_multilevel_quadratic(
             f"used_bits={used:.2f}, budget_bits={extra_budget:.2f}"
         )
 
+    layer_best: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
+    dirty_keys = set(states.keys())
+
     while True:
+        remain_budget = extra_budget - used
+        if remain_budget <= 1e-9:
+            break
+
+        # Lazy update: only recompute modified (or budget-invalidated) layers.
+        if dirty_keys:
+            for key in list(dirty_keys):
+                layer_best[key] = _best_action_for_state(states[key], remain_budget)
+            dirty_keys.clear()
+
         best_key = None
         best_idx = -1
         best_to_state = MP_STATE_DROP
         best_gain = 0.0
         best_density = 0.0
         best_cost = 0.0
+        budget_invalid = []
 
-        for key, st in states.items():
-            active = st["active"]  # type: ignore[assignment]
-            cand_idx = torch.where(active)[0]
-            if cand_idx.numel() == 0:
+        for key, cand in layer_best.items():
+            if cand is None:
                 continue
-            for idx_t in cand_idx:
-                idx = int(idx_t.item())
-                cur = int(st["state"][idx].item())  # type: ignore[index]
-                transitions = []
-                if cur == MP_STATE_DROP:
-                    transitions = [MP_STATE_LOW, MP_STATE_HIGH]
-                elif cur == MP_STATE_LOW:
-                    transitions = [MP_STATE_HIGH]
-                for to_state in transitions:
-                    gain, density = _action_gain_density(st, idx, to_state)
-                    if gain <= 0.0 or density <= 0.0:
-                        continue
-                    cost_drop = float(st["cost_drop"])
-                    cost_low = float(st["cost_low"])
-                    cost_high = float(st["cost_high"])
-                    if cur == MP_STATE_DROP and to_state == MP_STATE_LOW:
-                        delta_cost = cost_low - cost_drop
-                    elif cur == MP_STATE_DROP and to_state == MP_STATE_HIGH:
-                        delta_cost = cost_high - cost_drop
-                    else:
-                        delta_cost = cost_high - cost_low
-                    if used + delta_cost > extra_budget + 1e-9:
-                        continue
-                    if density > best_density:
-                        best_density = density
-                        best_gain = gain
-                        best_key = key
-                        best_idx = idx
-                        best_to_state = to_state
-                        best_cost = delta_cost
+            idx, to_state, gain, density, delta_cost = cand
+            if delta_cost > remain_budget + 1e-9:
+                budget_invalid.append(key)
+                continue
+            if density > best_density:
+                best_key = key
+                best_idx = idx
+                best_to_state = to_state
+                best_gain = gain
+                best_density = density
+                best_cost = delta_cost
 
         if best_key is None or best_idx < 0 or best_gain <= 0.0:
+            if budget_invalid:
+                dirty_keys.update(budget_invalid)
+                continue
             break
+
         st = states[best_key]
         used += _apply_action(st, best_idx, best_to_state)
         if best_cost <= 0.0:
             break
+        dirty_keys.add(best_key)
 
     for key, st in states.items():
         alloc[key] = st["state"].clone()  # type: ignore[assignment]
