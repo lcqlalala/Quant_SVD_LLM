@@ -1,11 +1,13 @@
 import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 try:
     import bitsandbytes as bnb  # type: ignore[import-not-found]
@@ -412,6 +414,7 @@ def collect_kfac_stats_sigma_full(
     compute_dev = torch.device(device)
     stats_dev = torch.device(accum_device) if accum_device is not None else compute_dev
     param_grad_state = [(p, p.requires_grad) for p in model.parameters()]
+    fn_t0 = time.perf_counter()
 
     try:
         # Freeze all parameters first to avoid allocating full-model gradients.
@@ -464,14 +467,34 @@ def collect_kfac_stats_sigma_full(
 
         cached_batches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
         if layerwise:
+            cache_t0 = time.perf_counter()
             cached_batches = []
             for idx, batch in enumerate(dataloader):
                 if idx >= nsamples:
                     break
                 cached_batches.append((batch[0].detach().cpu(), batch[1].detach().cpu()))
+            print(
+                f"[KFAC sigma_full] cached {len(cached_batches)} batches for layerwise replay "
+                f"in {time.perf_counter() - cache_t0:.2f}s"
+            )
 
         pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
-        for subset in pair_subsets:
+        print(
+            f"[KFAC sigma_full] start: layerwise={layerwise}, subsets={len(pair_subsets)}, "
+            f"pairs={len(pairs)}, nsamples={nsamples}, accum_device={stats_dev}"
+        )
+        subset_bar = tqdm(
+            enumerate(pair_subsets, start=1),
+            total=len(pair_subsets),
+            desc="KFAC sigma_full",
+            dynamic_ncols=True,
+        )
+        for subset_idx, subset in subset_bar:
+            subset_t0 = time.perf_counter()
+            layer_idx = _extract_layer_index(subset[0].parent_path) if len(subset) > 0 else None
+            subset_name = (
+                f"layer-{layer_idx}" if layer_idx is not None else f"subset-{subset_idx}"
+            )
             subset_proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
             for pair in subset:
                 pair.u_module.weight.requires_grad_(True)
@@ -508,13 +531,29 @@ def collect_kfac_stats_sigma_full(
                         break
                     run_batches.append((batch[0], batch[1]))
 
-            for input_ids, labels in run_batches:
+            print(
+                f"[KFAC sigma_full] {subset_name}: pairs={len(subset)}, batches={len(run_batches)}"
+            )
+            batch_bar = tqdm(
+                enumerate(run_batches, start=1),
+                total=len(run_batches),
+                desc=f"{subset_name} batches",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            for batch_idx, (input_ids, labels) in batch_bar:
+                batch_t0 = time.perf_counter()
                 input_ids = input_ids.to(device)
                 labels = labels.to(device)
                 model.zero_grad(set_to_none=True)
                 out = model(input_ids=input_ids, labels=labels, use_cache=False)
                 loss = out.loss
                 loss.backward()
+                if batch_idx == 1 or batch_idx == len(run_batches) or batch_idx % max(1, len(run_batches) // 4) == 0:
+                    batch_bar.set_postfix(
+                        loss=f"{float(loss.detach().item()):.4f}",
+                        sec=f"{time.perf_counter() - batch_t0:.2f}",
+                    )
                 del out, loss
 
             for h in handles:
@@ -523,6 +562,13 @@ def collect_kfac_stats_sigma_full(
             for pair in subset:
                 pair.u_module.weight.requires_grad_(False)
             subset_proj_cache.clear()
+            subset_sec = time.perf_counter() - subset_t0
+            mean_sec = subset_sec / max(len(run_batches), 1)
+            print(
+                f"[KFAC sigma_full] done {subset_name}: {subset_sec:.2f}s total, "
+                f"{mean_sec:.2f}s/batch"
+            )
+            subset_bar.set_postfix(layer=subset_name, sec=f"{subset_sec:.1f}")
 
         for key, v in stats.items():
             ca = max(float(v["count_a"]), 1.0)
@@ -532,6 +578,7 @@ def collect_kfac_stats_sigma_full(
             del v["count_a"]
             del v["count_g"]
 
+        print(f"[KFAC sigma_full] finished in {time.perf_counter() - fn_t0:.2f}s")
         return stats
     finally:
         for p, req in param_grad_state:
