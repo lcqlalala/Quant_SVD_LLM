@@ -1032,7 +1032,7 @@ def solve_budgeted_multilevel_quadratic(
         if cost_dl > 0.0 and cost_dl <= remain_budget + eps_budget:
             mask_dl = active & (state == MP_STATE_DROP)
             if torch.any(mask_dl):
-                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var)
+                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
                 gain_dl = torch.where(mask_dl, gain_dl, inf_neg)
                 max_gain_dl, idx_dl = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain_dl.item())
@@ -1049,7 +1049,7 @@ def solve_budgeted_multilevel_quadratic(
         if cost_dh > 0.0 and cost_dh <= remain_budget + eps_budget:
             mask_dh = active & (state == MP_STATE_DROP)
             if torch.any(mask_dh):
-                gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var)
+                gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var * diag)
                 gain_dh = torch.where(mask_dh, gain_dh, inf_neg)
                 max_gain_dh, idx_dh = torch.max(gain_dh, dim=0)
                 gain_val = float(max_gain_dh.item())
