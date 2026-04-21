@@ -14,6 +14,7 @@ from gptq.quant import *
 from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
+    apply_non_svd_fp16_cast,
     apply_non_svd_int8_quantization,
     apply_embed_tokens_fp16,
     apply_embed_tokens_int8_quantization,
@@ -541,7 +542,11 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--mp-quantize-nonsvd-int8', action='store_true',
-        help='Additionally quantize non-SVD nn.Linear modules (e.g., lm_head) with int8 weight-only quantization.'
+        help='[Deprecated] Quantize non-SVD nn.Linear modules to int8. Prefer --mp-nonsvd-precision int8.'
+    )
+    parser.add_argument(
+        '--mp-nonsvd-precision', type=str, default='fp16', choices=['fp16', 'int8'],
+        help='Non-SVD nn.Linear precision mode: fp16 or int8.'
     )
     parser.add_argument(
         '--mp-nonsvd-int8-exclude-lm-head', action='store_true',
@@ -601,6 +606,9 @@ if __name__ == '__main__':
     if args.mp_quantize_embed_int8 and args.mp_embed_precision != "int8":
         print("Warning: --mp-quantize-embed-int8 is deprecated; overriding --mp-embed-precision to int8.")
         args.mp_embed_precision = "int8"
+    if args.mp_quantize_nonsvd_int8 and args.mp_nonsvd_precision != "int8":
+        print("Warning: --mp-quantize-nonsvd-int8 is deprecated; overriding --mp-nonsvd-precision to int8.")
+        args.mp_nonsvd_precision = "int8"
 
     def resolve_save_path(save_arg: str) -> str:
         if save_arg is None or len(save_arg.strip()) == 0:
@@ -805,7 +813,7 @@ if __name__ == '__main__':
             int4_quant_type=args.mp_int4_quant_type,
         )
         nonsvd_report = None
-        if args.mp_quantize_nonsvd_int8:
+        if args.mp_nonsvd_precision == "int8":
             nonsvd_report = apply_non_svd_int8_quantization(
                 model=model,
                 pairs=pairs,
@@ -815,6 +823,19 @@ if __name__ == '__main__':
             print(
                 "Applied non-SVD int8 quantization: "
                 f"replaced={nonsvd_report['replaced']}, "
+                f"total_linear={nonsvd_report['total_linear']}, "
+                f"skipped={nonsvd_report['skipped']}, "
+                f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
+            )
+        else:
+            nonsvd_report = apply_non_svd_fp16_cast(
+                model=model,
+                pairs=pairs,
+                exclude_lm_head=args.mp_nonsvd_int8_exclude_lm_head,
+            )
+            print(
+                "Applied non-SVD fp16 cast: "
+                f"converted={nonsvd_report['converted']}, "
                 f"total_linear={nonsvd_report['total_linear']}, "
                 f"skipped={nonsvd_report['skipped']}, "
                 f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
@@ -888,7 +909,8 @@ if __name__ == '__main__':
                     "use_int8_kernel": bool(not args.mp_disable_int8_kernel),
                     "use_int4_kernel": bool(args.mp_enable_int4_kernel),
                     "int4_quant_type": args.mp_int4_quant_type,
-                    "quantize_nonsvd_int8": bool(args.mp_quantize_nonsvd_int8),
+                    "quantize_nonsvd_int8": bool(args.mp_nonsvd_precision == "int8"),
+                    "nonsvd_precision": args.mp_nonsvd_precision,
                     "nonsvd_int8_exclude_lm_head": bool(args.mp_nonsvd_int8_exclude_lm_head),
                     "quantize_embed_int8": bool(args.mp_embed_precision == "int8"),
                     "embed_precision": args.mp_embed_precision,

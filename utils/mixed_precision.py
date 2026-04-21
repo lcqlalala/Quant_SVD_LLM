@@ -2235,6 +2235,56 @@ def apply_two_path_quantization(
 
 
 @torch.no_grad()
+def apply_non_svd_fp16_cast(
+    model: nn.Module,
+    pairs: List[PairModules],
+    exclude_lm_head: bool = False,
+) -> Dict[str, int]:
+    """
+    Cast non-SVD nn.Linear modules to fp16.
+    Excludes all *_u_proj/*_v_proj pair modules tracked by `pairs`.
+    """
+    excluded_ids = set()
+    for pair in pairs:
+        excluded_ids.add(id(pair.u_module))
+        excluded_ids.add(id(pair.v_module))
+
+    converted = 0
+    skipped = 0
+    total_linear = 0
+    for path, mod in list(model.named_modules()):
+        if path == "" or not isinstance(mod, nn.Linear):
+            continue
+        total_linear += 1
+        if id(mod) in excluded_ids:
+            skipped += 1
+            continue
+        if path.endswith("_u_proj") or path.endswith("_v_proj"):
+            skipped += 1
+            continue
+        if path.endswith("_mp_proj"):
+            skipped += 1
+            continue
+        if exclude_lm_head and path == "lm_head":
+            skipped += 1
+            continue
+        if not mod.weight.is_floating_point():
+            skipped += 1
+            continue
+        if mod.weight.dtype != torch.float16:
+            mod.weight.data = mod.weight.data.to(dtype=torch.float16)
+            if mod.bias is not None and mod.bias.data.is_floating_point():
+                mod.bias.data = mod.bias.data.to(dtype=torch.float16)
+            converted += 1
+
+    return {
+        "total_linear": total_linear,
+        "converted": converted,
+        "skipped": skipped,
+    }
+
+
+@torch.no_grad()
 def apply_non_svd_int8_quantization(
     model: nn.Module,
     pairs: List[PairModules],
