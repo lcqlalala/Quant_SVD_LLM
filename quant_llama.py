@@ -15,6 +15,7 @@ from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
     apply_non_svd_int8_quantization,
+    apply_embed_tokens_fp16,
     apply_embed_tokens_int8_quantization,
     build_pair_whiten_inv,
     calibrate_component_sigma,
@@ -548,7 +549,11 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--mp-quantize-embed-int8', action='store_true',
-        help='Quantize embed_tokens nn.Embedding to int8 weight-only.'
+        help='[Deprecated] Quantize embed_tokens to int8. Prefer --mp-embed-precision int8.'
+    )
+    parser.add_argument(
+        '--mp-embed-precision', type=str, default='fp16', choices=['fp16', 'int8'],
+        help='Embedding precision mode for embed_tokens: fp16 or int8.'
     )
     parser.add_argument(
         '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
@@ -593,6 +598,9 @@ if __name__ == '__main__':
             f"mp_target_compression_ratio={args.mp_target_compression_ratio:.4f} "
             f"(base_weight_bits={base_weight_bits:.1f})"
         )
+    if args.mp_quantize_embed_int8 and args.mp_embed_precision != "int8":
+        print("Warning: --mp-quantize-embed-int8 is deprecated; overriding --mp-embed-precision to int8.")
+        args.mp_embed_precision = "int8"
 
     def resolve_save_path(save_arg: str) -> str:
         if save_arg is None or len(save_arg.strip()) == 0:
@@ -812,11 +820,19 @@ if __name__ == '__main__':
                 f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
             )
         embed_report = None
-        if args.mp_quantize_embed_int8:
+        if args.mp_embed_precision == "int8":
             embed_report = apply_embed_tokens_int8_quantization(model=model)
             print(
                 "Applied embed_tokens int8 quantization: "
                 f"replaced={embed_report['replaced']}, "
+                f"total_embedding={embed_report['total_embedding']}, "
+                f"skipped={embed_report['skipped']}"
+            )
+        else:
+            embed_report = apply_embed_tokens_fp16(model=model)
+            print(
+                "Applied embed_tokens fp16 cast: "
+                f"converted={embed_report['converted']}, "
                 f"total_embedding={embed_report['total_embedding']}, "
                 f"skipped={embed_report['skipped']}"
             )
@@ -874,7 +890,8 @@ if __name__ == '__main__':
                     "int4_quant_type": args.mp_int4_quant_type,
                     "quantize_nonsvd_int8": bool(args.mp_quantize_nonsvd_int8),
                     "nonsvd_int8_exclude_lm_head": bool(args.mp_nonsvd_int8_exclude_lm_head),
-                    "quantize_embed_int8": bool(args.mp_quantize_embed_int8),
+                    "quantize_embed_int8": bool(args.mp_embed_precision == "int8"),
+                    "embed_precision": args.mp_embed_precision,
                     "target_compression_ratio": float(args.mp_target_compression_ratio),
                     "enable_drop": bool(args.mp_enable_drop),
                     "drop_bit": float(args.mp_drop_bit),

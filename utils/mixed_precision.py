@@ -2289,6 +2289,39 @@ def apply_non_svd_int8_quantization(
 
 
 @torch.no_grad()
+def apply_embed_tokens_fp16(
+    model: nn.Module,
+    include_names: Optional[List[str]] = None,
+) -> Dict[str, int]:
+    """
+    Cast embedding modules named 'embed_tokens' (or custom names) to fp16.
+    """
+    include = include_names if include_names is not None else ["embed_tokens"]
+    converted = 0
+    skipped = 0
+    total_embedding = 0
+    for path, mod in list(model.named_modules()):
+        if path == "" or not isinstance(mod, nn.Embedding):
+            continue
+        total_embedding += 1
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf not in include:
+            skipped += 1
+            continue
+        if not mod.weight.is_floating_point():
+            skipped += 1
+            continue
+        if mod.weight.dtype != torch.float16:
+            mod.weight.data = mod.weight.data.to(dtype=torch.float16)
+            converted += 1
+    return {
+        "total_embedding": total_embedding,
+        "converted": converted,
+        "skipped": skipped,
+    }
+
+
+@torch.no_grad()
 def apply_embed_tokens_int8_quantization(
     model: nn.Module,
     include_names: Optional[List[str]] = None,
