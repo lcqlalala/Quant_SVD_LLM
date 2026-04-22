@@ -395,6 +395,7 @@ def collect_kfac_stats_sigma_full(
     pairs: List[PairModules],
     dataloader,
     device: str = "cuda",
+    proj_device: Optional[str] = None,
     accum_device: Optional[str] = None,
     nsamples: int = 8,
     whiten_inv: Optional[Dict[str, torch.Tensor]] = None,
@@ -412,6 +413,7 @@ def collect_kfac_stats_sigma_full(
     stats: Dict[str, Dict[str, torch.Tensor]] = {}
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
     compute_dev = torch.device(device)
+    proj_dev = torch.device(proj_device) if proj_device is not None else compute_dev
     stats_dev = torch.device(accum_device) if accum_device is not None else compute_dev
     param_grad_state = [(p, p.requires_grad) for p in model.parameters()]
     fn_t0 = time.perf_counter()
@@ -435,6 +437,8 @@ def collect_kfac_stats_sigma_full(
             def _hook(module, inputs):
                 x = inputs[0].detach().float()
                 x_flat = x.reshape(-1, x.shape[-1])
+                if x_flat.device != proj_dev:
+                    x_flat = x_flat.to(device=proj_dev, non_blocking=True)
                 if "W_inv" in subset_proj_cache[k]:
                     x_flat = x_flat.matmul(subset_proj_cache[k]["W_inv"])
                 V_proj = subset_proj_cache[k]["V_proj"]
@@ -453,6 +457,8 @@ def collect_kfac_stats_sigma_full(
             def _hook(module, grad_input, grad_output):
                 g = grad_output[0].detach().float()
                 g_flat = g.reshape(-1, g.shape[-1])
+                if g_flat.device != proj_dev:
+                    g_flat = g_flat.to(device=proj_dev, non_blocking=True)
                 U_proj = subset_proj_cache[k]["U_proj"]
                 g_proj = g_flat if g_flat.dtype == U_proj.dtype else g_flat.to(dtype=U_proj.dtype)
                 s = g_proj.matmul(U_proj)
@@ -481,7 +487,8 @@ def collect_kfac_stats_sigma_full(
         pair_subsets = _group_pairs_by_layer(pairs) if layerwise else [pairs]
         print(
             f"[KFAC sigma_full] start: layerwise={layerwise}, subsets={len(pair_subsets)}, "
-            f"pairs={len(pairs)}, nsamples={nsamples}, accum_device={stats_dev}"
+            f"pairs={len(pairs)}, nsamples={nsamples}, compute_device={compute_dev}, "
+            f"proj_device={proj_dev}, accum_device={stats_dev}"
         )
         subset_bar = tqdm(
             enumerate(pair_subsets, start=1),
@@ -498,23 +505,23 @@ def collect_kfac_stats_sigma_full(
             subset_proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
             for pair in subset:
                 pair.u_module.weight.requires_grad_(True)
-                U_proj = pair.u_module.weight.detach().to(device=compute_dev)
-                V_proj = pair.v_module.weight.detach().to(device=compute_dev)
+                U_proj = pair.u_module.weight.detach().to(device=proj_dev)
+                V_proj = pair.v_module.weight.detach().to(device=proj_dev)
                 if explicit_sigma:
                     _, _, _, active, u_scale, v_scale = _compute_sigma_component_norms(
                         u_weight=U_proj,
                         v_weight=V_proj,
                         eps=sigma_eps,
                     )
-                    active_mask_u = active.to(device=compute_dev, dtype=U_proj.dtype).unsqueeze(0)
-                    active_mask_v = active.to(device=compute_dev, dtype=V_proj.dtype).unsqueeze(1)
-                    u_scale = torch.where(active, u_scale, torch.ones_like(u_scale)).to(device=compute_dev, dtype=U_proj.dtype)
-                    v_scale = torch.where(active, v_scale, torch.ones_like(v_scale)).to(device=compute_dev, dtype=V_proj.dtype)
+                    active_mask_u = active.to(device=proj_dev, dtype=U_proj.dtype).unsqueeze(0)
+                    active_mask_v = active.to(device=proj_dev, dtype=V_proj.dtype).unsqueeze(1)
+                    u_scale = torch.where(active, u_scale, torch.ones_like(u_scale)).to(device=proj_dev, dtype=U_proj.dtype)
+                    v_scale = torch.where(active, v_scale, torch.ones_like(v_scale)).to(device=proj_dev, dtype=V_proj.dtype)
                     U_proj = (U_proj / u_scale.unsqueeze(0)) * active_mask_u
                     V_proj = (V_proj / v_scale.unsqueeze(1)) * active_mask_v
                 entry: Dict[str, torch.Tensor] = {"U_proj": U_proj, "V_proj": V_proj}
                 if whiten_inv is not None and pair.key in whiten_inv:
-                    entry["W_inv"] = whiten_inv[pair.key].to(device=compute_dev, dtype=torch.float32)
+                    entry["W_inv"] = whiten_inv[pair.key].to(device=proj_dev, dtype=torch.float32)
                 subset_proj_cache[pair.key] = entry
 
             handles = []

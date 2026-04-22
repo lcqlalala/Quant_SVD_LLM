@@ -448,6 +448,10 @@ if __name__ == '__main__':
         help='Device used to accumulate K-FAC statistics matrices. cpu uses less GPU memory but is slower.'
     )
     parser.add_argument(
+        '--mp-kfac-proj-device', type=str, default=None,
+        help='Optional device for sigma_full projection buffers (U/V/W_inv) and hook-side projection matmuls, e.g., cuda:1.'
+    )
+    parser.add_argument(
         '--mp-explicit-sigma', action='store_true',
         help='Use explicit W=U*diag(sigma)*V^T parameterization for sigma-space Fisher and MP quantization.'
     )
@@ -758,6 +762,7 @@ if __name__ == '__main__':
                 pairs=pairs,
                 dataloader=dataloader,
                 device=args.DEV,
+                proj_device=args.mp_kfac_proj_device,
                 accum_device=args.mp_kfac_accum_device,
                 nsamples=args.mp_kfac_nsamples,
                 whiten_inv=whiten_inv,
