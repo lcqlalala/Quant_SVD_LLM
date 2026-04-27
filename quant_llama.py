@@ -546,6 +546,11 @@ if __name__ == '__main__':
              'Set <0 to auto-select by model family.'
     )
     parser.add_argument(
+        '--mp-allow-drop-to-high', action='store_true',
+        help='Allow direct drop->high upgrades in three-state allocation. '
+             'By default, dropped components are restored through low/int4 first.'
+    )
+    parser.add_argument(
         '--mp-model-family', type=str, default='auto', choices=['auto', 'llama', 'llama2', 'llama3'],
         help='Model family hint for MP allocation safeguards. '
              'auto infers from model/tokenizer path; manually set when paths are ambiguous.'
@@ -825,6 +830,7 @@ if __name__ == '__main__':
                     drop_bit=args.mp_drop_bit,
                     min_keep_ratio=args.mp_min_keep_ratio,
                     max_drop_ratio=args.mp_max_drop_ratio,
+                    prefer_low_from_drop=not args.mp_allow_drop_to_high,
                 )
             else:
                 alloc = solve_budgeted_topk_quadratic(
@@ -966,6 +972,7 @@ if __name__ == '__main__':
                     "drop_bit": float(args.mp_drop_bit),
                     "min_keep_ratio": float(args.mp_min_keep_ratio),
                     "max_drop_ratio": float(args.mp_max_drop_ratio),
+                    "prefer_low_from_drop": bool(not args.mp_allow_drop_to_high),
                     "model_family": resolved_family,
                     "allocation_report": alloc_report,
                 },

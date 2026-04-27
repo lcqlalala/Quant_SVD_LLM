@@ -887,6 +887,7 @@ def solve_budgeted_multilevel_quadratic(
     drop_bit: float = 0.0,
     min_keep_ratio: float = 0.0,
     max_drop_ratio: float = 1.0,
+    prefer_low_from_drop: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
     Unified drop/low/high allocation with sigma-space quadratic objective.
@@ -1055,9 +1056,10 @@ def solve_budgeted_multilevel_quadratic(
                         best_density = density
                         best_cost = cost_dl
 
-        # Drop -> High
+        # Drop -> High. By default we route dropped components through low first,
+        # which preserves more components under tight budgets.
         cost_dh = cost_high - cost_drop
-        if cost_dh > 0.0 and cost_dh <= remain_budget + eps_budget:
+        if (not prefer_low_from_drop) and cost_dh > 0.0 and cost_dh <= remain_budget + eps_budget:
             mask_dh = active & (state == MP_STATE_DROP)
             if torch.any(mask_dh):
                 gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var * diag)
@@ -1099,6 +1101,84 @@ def solve_budgeted_multilevel_quadratic(
             return None
         return best_idx, best_to_state, best_gain, best_density, best_cost
 
+    def _active_allocation_counts() -> Tuple[int, int, int, int]:
+        active_high = 0
+        active_low = 0
+        active_drop = 0
+        active_total = 0
+        for st in states.values():
+            active = st["active"]  # type: ignore[assignment]
+            state = st["state"]  # type: ignore[assignment]
+            active_total += int(active.sum().item())
+            active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
+            active_low += int(((state == MP_STATE_LOW) & active).sum().item())
+            active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
+        return active_high, active_low, active_drop, active_total
+
+    def _enforce_max_drop_ratio() -> None:
+        nonlocal used
+        if max_drop_ratio >= 1.0 or total_params <= 0.0:
+            return
+        eps_budget = 1e-9
+        while True:
+            _, _, active_drop, active_total = _active_allocation_counts()
+            if active_total == 0:
+                return
+            cur_ratio = float(active_drop) / float(active_total)
+            if cur_ratio <= max_drop_ratio + 1e-12:
+                return
+
+            remain_budget = extra_budget - used
+            if remain_budget <= eps_budget:
+                print(
+                    "Warning: max_drop_ratio could not be satisfied within target budget; "
+                    f"active_drop_ratio={cur_ratio:.4f}, max_drop_ratio={max_drop_ratio:.4f}, "
+                    f"budget_use={used:.2f}/{extra_budget:.2f}"
+                )
+                return
+
+            best_key = None
+            best_idx = -1
+            best_density = -float("inf")
+            best_cost = 0.0
+            for key, st in states.items():
+                active = st["active"]  # type: ignore[assignment]
+                state = st["state"]  # type: ignore[assignment]
+                sigma = st["sigma"]  # type: ignore[assignment]
+                diag = st["diag"]  # type: ignore[assignment]
+                Fd = st["Fd"]  # type: ignore[assignment]
+                low_var = st["low_var"]  # type: ignore[assignment]
+                cost_drop = float(st["cost_drop"])
+                cost_low = float(st["cost_low"])
+                cost_dl = cost_low - cost_drop
+                if cost_dl <= 0.0 or cost_dl > remain_budget + eps_budget:
+                    continue
+                mask = active & (state == MP_STATE_DROP)
+                if not torch.any(mask):
+                    continue
+                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
+                gain_dl = torch.where(mask, gain_dl, torch.tensor(-float("inf"), dtype=torch.float32))
+                max_gain, idx_t = torch.max(gain_dl, dim=0)
+                gain_val = float(max_gain.item())
+                density = gain_val / max(cost_dl, 1e-12)
+                if density > best_density:
+                    best_density = density
+                    best_key = key
+                    best_idx = int(idx_t.item())
+                    best_cost = cost_dl
+
+            if best_key is None or best_idx < 0:
+                print(
+                    "Warning: max_drop_ratio could not be satisfied because no feasible drop->low "
+                    f"upgrade remains; active_drop_ratio={cur_ratio:.4f}, "
+                    f"max_drop_ratio={max_drop_ratio:.4f}"
+                )
+                return
+
+            used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
+            if best_cost <= 0.0:
+                return
+
     if min_keep_ratio > 0.0:
         for key, st in states.items():
             active = st["active"]  # type: ignore[assignment]
@@ -1126,6 +1206,10 @@ def solve_budgeted_multilevel_quadratic(
             "Warning: min_keep_ratio bootstrap exceeds target budget; "
             f"used_bits={used:.2f}, budget_bits={extra_budget:.2f}"
         )
+
+    # Satisfy the structural drop cap before gain-based upgrades spend budget
+    # on low->high transitions.
+    _enforce_max_drop_ratio()
 
     layer_best: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
     dirty_keys = set(states.keys())
@@ -1175,6 +1259,10 @@ def solve_budgeted_multilevel_quadratic(
         if best_cost <= 0.0:
             break
         dirty_keys.add(best_key)
+
+    # Re-check after positive-gain upgrades. This should usually be a no-op,
+    # but keeps the constraint explicit if future transitions are added.
+    _enforce_max_drop_ratio()
 
     # Budget fill stage: if positive-gain greedy stops early, continue with
     # minimum-harm upgrades to approach target average bit.
@@ -1234,79 +1322,9 @@ def solve_budgeted_multilevel_quadratic(
             dirty_fill.add(best_key)
             step += 1
 
-    # Optional drop-ratio cap on active components for stability across model families.
-    if max_drop_ratio < 1.0 and total_params > 0.0:
-        eps_budget = 1e-9
-        while True:
-            active_high = 0
-            active_low = 0
-            active_drop = 0
-            active_total = 0
-            for st in states.values():
-                active = st["active"]  # type: ignore[assignment]
-                state = st["state"]  # type: ignore[assignment]
-                active_total += int(active.sum().item())
-                active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
-                active_low += int(((state == MP_STATE_LOW) & active).sum().item())
-                active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
-            if active_total == 0:
-                break
-            if float(active_drop) / float(active_total) <= max_drop_ratio + 1e-12:
-                break
-
-            remain_budget = extra_budget - used
-            if remain_budget <= eps_budget:
-                break
-
-            best_key = None
-            best_idx = -1
-            best_density = -float("inf")
-            best_cost = 0.0
-            for key, st in states.items():
-                active = st["active"]  # type: ignore[assignment]
-                state = st["state"]  # type: ignore[assignment]
-                sigma = st["sigma"]  # type: ignore[assignment]
-                diag = st["diag"]  # type: ignore[assignment]
-                Fd = st["Fd"]  # type: ignore[assignment]
-                low_var = st["low_var"]  # type: ignore[assignment]
-                cost_drop = float(st["cost_drop"])
-                cost_low = float(st["cost_low"])
-                cost_dl = cost_low - cost_drop
-                if cost_dl <= 0.0 or cost_dl > remain_budget + eps_budget:
-                    continue
-                mask = active & (state == MP_STATE_DROP)
-                if not torch.any(mask):
-                    continue
-                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
-                gain_dl = torch.where(mask, gain_dl, torch.tensor(-float("inf"), dtype=torch.float32))
-                max_gain, idx_t = torch.max(gain_dl, dim=0)
-                gain_val = float(max_gain.item())
-                density = gain_val / max(cost_dl, 1e-12)
-                if density > best_density:
-                    best_density = density
-                    best_key = key
-                    best_idx = int(idx_t.item())
-                    best_cost = cost_dl
-
-            if best_key is None or best_idx < 0:
-                break
-            used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
-            if best_cost <= 0.0:
-                break
-
     # Print active-only allocation summary to avoid misleading drop ratio
     # from inactive zero-amplitude components.
-    active_high = 0
-    active_low = 0
-    active_drop = 0
-    active_total = 0
-    for st in states.values():
-        active = st["active"]  # type: ignore[assignment]
-        state = st["state"]  # type: ignore[assignment]
-        active_total += int(active.sum().item())
-        active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
-        active_low += int(((state == MP_STATE_LOW) & active).sum().item())
-        active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
+    active_high, active_low, active_drop, active_total = _active_allocation_counts()
     if active_total > 0:
         active_avg_bits = (
             active_high * float(high_bit) + active_low * float(low_bit) + active_drop * float(drop_bit)
