@@ -50,6 +50,23 @@ def _base_weight_bits_from_dtype(dtype_name: str) -> float:
     return 16.0
 
 
+def _infer_llama_family_from_paths(model_path: str, tokenizer_path: str) -> str:
+    text = f"{model_path or ''} {tokenizer_path or ''}".lower()
+    if "llama-2" in text or "llama_2" in text:
+        return "llama2"
+    if "llama-3" in text or "llama_3" in text or "llama3" in text:
+        return "llama3"
+    if "llama" in text:
+        return "llama"
+    return "unknown"
+
+
+def _resolve_llama_family(model_path: str, tokenizer_path: str, family_arg: str) -> str:
+    if family_arg and family_arg != "auto":
+        return family_arg
+    return _infer_llama_family_from_paths(model_path, tokenizer_path)
+
+
 def _pack_int4_signed_rows(q: torch.Tensor) -> Tuple[torch.Tensor, int]:
     """
     Pack int8 tensor in [-8, 7] into uint8 (2 values per byte) along dim=1.
@@ -524,6 +541,16 @@ if __name__ == '__main__':
         help='Minimum per-pair keep ratio (drop->low bootstrap) when joint drop allocation is enabled.'
     )
     parser.add_argument(
+        '--mp-max-drop-ratio', type=float, default=-1.0,
+        help='Maximum allowed active drop ratio in three-state allocation. '
+             'Set <0 to auto-select by model family.'
+    )
+    parser.add_argument(
+        '--mp-model-family', type=str, default='auto', choices=['auto', 'llama', 'llama2', 'llama3'],
+        help='Model family hint for MP allocation safeguards. '
+             'auto infers from model/tokenizer path; manually set when paths are ambiguous.'
+    )
+    parser.add_argument(
         '--mp-target-compression-ratio', type=float, default=0.0,
         help='If >0, auto-set mp_avg_bit from target low-rank compression ratio. '
              'Computed as mp_avg_bit = base_weight_bits / ratio, then clamped to [mp-low-bit, mp-high-bit].'
@@ -607,6 +634,20 @@ if __name__ == '__main__':
             f"mp_target_compression_ratio={args.mp_target_compression_ratio:.4f} "
             f"(base_weight_bits={base_weight_bits:.1f})"
         )
+    resolved_family = _resolve_llama_family(args.model_path, args.tokenizer_path, args.mp_model_family)
+    if args.mp_enable_drop and args.mp_max_drop_ratio < 0:
+        fam = resolved_family
+        if fam == "llama2":
+            args.mp_max_drop_ratio = 0.30
+        elif fam == "llama3":
+            args.mp_max_drop_ratio = 0.40
+        else:
+            args.mp_max_drop_ratio = 0.50
+        print(
+            f"Auto-set mp_max_drop_ratio={args.mp_max_drop_ratio:.2f} "
+            f"for model_family={fam}"
+        )
+    print(f"Resolved mp_model_family={resolved_family}")
     if args.mp_quantize_embed_int8 and args.mp_embed_precision != "int8":
         print("Warning: --mp-quantize-embed-int8 is deprecated; overriding --mp-embed-precision to int8.")
         args.mp_embed_precision = "int8"
@@ -783,6 +824,7 @@ if __name__ == '__main__':
                     sigma_eps=args.mp_sigma_eps,
                     drop_bit=args.mp_drop_bit,
                     min_keep_ratio=args.mp_min_keep_ratio,
+                    max_drop_ratio=args.mp_max_drop_ratio,
                 )
             else:
                 alloc = solve_budgeted_topk_quadratic(
@@ -923,6 +965,8 @@ if __name__ == '__main__':
                     "enable_drop": bool(args.mp_enable_drop),
                     "drop_bit": float(args.mp_drop_bit),
                     "min_keep_ratio": float(args.mp_min_keep_ratio),
+                    "max_drop_ratio": float(args.mp_max_drop_ratio),
+                    "model_family": resolved_family,
                     "allocation_report": alloc_report,
                 },
                 "packed_lowbit_q": True,

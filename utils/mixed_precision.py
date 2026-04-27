@@ -886,6 +886,7 @@ def solve_budgeted_multilevel_quadratic(
     sigma_eps: float = 1e-12,
     drop_bit: float = 0.0,
     min_keep_ratio: float = 0.0,
+    max_drop_ratio: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Unified drop/low/high allocation with sigma-space quadratic objective.
@@ -902,6 +903,8 @@ def solve_budgeted_multilevel_quadratic(
         raise ValueError("drop_bit must be non-negative")
     if not (0.0 <= min_keep_ratio <= 1.0):
         raise ValueError("min_keep_ratio must be in [0, 1]")
+    if not (0.0 <= max_drop_ratio <= 1.0):
+        raise ValueError("max_drop_ratio must be in [0, 1]")
 
     target_avg = min(max(avg_bit, float(drop_bit)), float(high_bit))
     states: Dict[str, Dict[str, object]] = {}
@@ -929,21 +932,21 @@ def solve_budgeted_multilevel_quadratic(
             continue
         total_params += params_per_component * float(active_count)
 
-        if sigma_calib is not None and pair.key in sigma_calib:
-            low_noise = sigma_calib[pair.key]["low"].float().clamp_min(0.0).cpu()
-            high_noise = sigma_calib[pair.key]["high"].float().clamp_min(0.0).cpu()
-        else:
-            low_noise = torch.full((rank,), noise_low, dtype=torch.float32)
-            high_noise = torch.full((rank,), noise_high, dtype=torch.float32)
-
         F = 0.5 * (F + F.transpose(0, 1))
-        diag = torch.diag(F)
+        # In theory Fisher diagonal should be non-negative; clamp for numerical robustness.
+        diag = torch.diag(F).clamp_min(0.0)
         d = torch.zeros(rank, dtype=torch.float32)
         d[active] = -sigma_vec[active]
         Fd = F.matmul(d)
 
-        low_var = (sigma_vec * sigma_vec) * low_noise
-        high_var = (sigma_vec * sigma_vec) * high_noise
+        if sigma_calib is not None and pair.key in sigma_calib:
+            # Calibrated sigma currently stores per-component approximation error.
+            # Use it directly as variance proxy to avoid multiplying sigma^2 twice.
+            low_var = sigma_calib[pair.key]["low"].float().clamp_min(0.0).cpu()
+            high_var = sigma_calib[pair.key]["high"].float().clamp_min(0.0).cpu()
+        else:
+            low_var = (sigma_vec * sigma_vec) * noise_low
+            high_var = (sigma_vec * sigma_vec) * noise_high
         low_var = torch.where(active, low_var, torch.zeros_like(low_var))
         high_var = torch.where(active, high_var, torch.zeros_like(high_var))
         var = torch.zeros(rank, dtype=torch.float32)
@@ -1006,7 +1009,7 @@ def solve_budgeted_multilevel_quadratic(
         return float(delta_cost)
 
     def _best_action_for_state(
-        st: Dict[str, object], remain_budget: float
+        st: Dict[str, object], remain_budget: float, allow_nonpositive: bool = False
     ) -> Optional[Tuple[int, int, float, float, float]]:
         """
         Return best feasible action as:
@@ -1030,8 +1033,8 @@ def solve_budgeted_multilevel_quadratic(
         inf_neg = torch.tensor(-float("inf"), dtype=torch.float32)
         best_idx = -1
         best_to_state = MP_STATE_DROP
-        best_gain = 0.0
-        best_density = 0.0
+        best_gain = -float("inf") if allow_nonpositive else 0.0
+        best_density = -float("inf") if allow_nonpositive else 0.0
         best_cost = 0.0
 
         # Drop -> Low
@@ -1043,13 +1046,14 @@ def solve_budgeted_multilevel_quadratic(
                 gain_dl = torch.where(mask_dl, gain_dl, inf_neg)
                 max_gain_dl, idx_dl = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain_dl.item())
-                if gain_val > 0.0:
+                if allow_nonpositive or gain_val > 0.0:
                     density = gain_val / cost_dl
-                    best_idx = int(idx_dl.item())
-                    best_to_state = MP_STATE_LOW
-                    best_gain = gain_val
-                    best_density = density
-                    best_cost = cost_dl
+                    if density > best_density:
+                        best_idx = int(idx_dl.item())
+                        best_to_state = MP_STATE_LOW
+                        best_gain = gain_val
+                        best_density = density
+                        best_cost = cost_dl
 
         # Drop -> High
         cost_dh = cost_high - cost_drop
@@ -1060,7 +1064,7 @@ def solve_budgeted_multilevel_quadratic(
                 gain_dh = torch.where(mask_dh, gain_dh, inf_neg)
                 max_gain_dh, idx_dh = torch.max(gain_dh, dim=0)
                 gain_val = float(max_gain_dh.item())
-                if gain_val > 0.0:
+                if allow_nonpositive or gain_val > 0.0:
                     density = gain_val / cost_dh
                     if density > best_density:
                         best_idx = int(idx_dh.item())
@@ -1078,7 +1082,7 @@ def solve_budgeted_multilevel_quadratic(
                 gain_lh = torch.where(mask_lh, gain_lh, inf_neg)
                 max_gain_lh, idx_lh = torch.max(gain_lh, dim=0)
                 gain_val = float(max_gain_lh.item())
-                if gain_val > 0.0:
+                if allow_nonpositive or gain_val > 0.0:
                     density = gain_val / cost_lh
                     if density > best_density:
                         best_idx = int(idx_lh.item())
@@ -1087,7 +1091,11 @@ def solve_budgeted_multilevel_quadratic(
                         best_density = density
                         best_cost = cost_lh
 
-        if best_idx < 0 or best_gain <= 0.0 or best_density <= 0.0:
+        if best_idx < 0:
+            return None
+        if (not allow_nonpositive) and (best_gain <= 0.0 or best_density <= 0.0):
+            return None
+        if allow_nonpositive and (not math.isfinite(best_density)):
             return None
         return best_idx, best_to_state, best_gain, best_density, best_cost
 
@@ -1167,6 +1175,149 @@ def solve_budgeted_multilevel_quadratic(
         if best_cost <= 0.0:
             break
         dirty_keys.add(best_key)
+
+    # Budget fill stage: if positive-gain greedy stops early, continue with
+    # minimum-harm upgrades to approach target average bit.
+    if total_params > 0.0 and used < extra_budget - 1e-6:
+        layer_best_fill: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
+        dirty_fill = set(states.keys())
+        max_steps = 0
+        for st in states.values():
+            active = st["active"]  # type: ignore[assignment]
+            # Each active component has at most two upward transitions:
+            # drop->low and low->high (or one direct drop->high).
+            max_steps += int(active.sum().item()) * 2
+        step = 0
+        while used < extra_budget - 1e-6 and step < max_steps:
+            remain_budget = extra_budget - used
+            if remain_budget <= 1e-9:
+                break
+            if dirty_fill:
+                for key in list(dirty_fill):
+                    layer_best_fill[key] = _best_action_for_state(
+                        states[key],
+                        remain_budget,
+                        allow_nonpositive=True,
+                    )
+                dirty_fill.clear()
+
+            best_key = None
+            best_idx = -1
+            best_to_state = MP_STATE_DROP
+            best_density = -float("inf")
+            best_cost = 0.0
+            budget_invalid = []
+            for key, cand in layer_best_fill.items():
+                if cand is None:
+                    continue
+                idx, to_state, gain, density, delta_cost = cand
+                if delta_cost > remain_budget + 1e-9:
+                    budget_invalid.append(key)
+                    continue
+                if density > best_density:
+                    best_key = key
+                    best_idx = idx
+                    best_to_state = to_state
+                    best_density = density
+                    best_cost = delta_cost
+
+            if best_key is None or best_idx < 0:
+                if budget_invalid:
+                    dirty_fill.update(budget_invalid)
+                    continue
+                break
+
+            st = states[best_key]
+            used += _apply_action(st, best_idx, best_to_state)
+            if best_cost <= 0.0:
+                break
+            dirty_fill.add(best_key)
+            step += 1
+
+    # Optional drop-ratio cap on active components for stability across model families.
+    if max_drop_ratio < 1.0 and total_params > 0.0:
+        eps_budget = 1e-9
+        while True:
+            active_high = 0
+            active_low = 0
+            active_drop = 0
+            active_total = 0
+            for st in states.values():
+                active = st["active"]  # type: ignore[assignment]
+                state = st["state"]  # type: ignore[assignment]
+                active_total += int(active.sum().item())
+                active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
+                active_low += int(((state == MP_STATE_LOW) & active).sum().item())
+                active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
+            if active_total == 0:
+                break
+            if float(active_drop) / float(active_total) <= max_drop_ratio + 1e-12:
+                break
+
+            remain_budget = extra_budget - used
+            if remain_budget <= eps_budget:
+                break
+
+            best_key = None
+            best_idx = -1
+            best_density = -float("inf")
+            best_cost = 0.0
+            for key, st in states.items():
+                active = st["active"]  # type: ignore[assignment]
+                state = st["state"]  # type: ignore[assignment]
+                sigma = st["sigma"]  # type: ignore[assignment]
+                diag = st["diag"]  # type: ignore[assignment]
+                Fd = st["Fd"]  # type: ignore[assignment]
+                low_var = st["low_var"]  # type: ignore[assignment]
+                cost_drop = float(st["cost_drop"])
+                cost_low = float(st["cost_low"])
+                cost_dl = cost_low - cost_drop
+                if cost_dl <= 0.0 or cost_dl > remain_budget + eps_budget:
+                    continue
+                mask = active & (state == MP_STATE_DROP)
+                if not torch.any(mask):
+                    continue
+                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
+                gain_dl = torch.where(mask, gain_dl, torch.tensor(-float("inf"), dtype=torch.float32))
+                max_gain, idx_t = torch.max(gain_dl, dim=0)
+                gain_val = float(max_gain.item())
+                density = gain_val / max(cost_dl, 1e-12)
+                if density > best_density:
+                    best_density = density
+                    best_key = key
+                    best_idx = int(idx_t.item())
+                    best_cost = cost_dl
+
+            if best_key is None or best_idx < 0:
+                break
+            used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
+            if best_cost <= 0.0:
+                break
+
+    # Print active-only allocation summary to avoid misleading drop ratio
+    # from inactive zero-amplitude components.
+    active_high = 0
+    active_low = 0
+    active_drop = 0
+    active_total = 0
+    for st in states.values():
+        active = st["active"]  # type: ignore[assignment]
+        state = st["state"]  # type: ignore[assignment]
+        active_total += int(active.sum().item())
+        active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
+        active_low += int(((state == MP_STATE_LOW) & active).sum().item())
+        active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
+    if active_total > 0:
+        active_avg_bits = (
+            active_high * float(high_bit) + active_low * float(low_bit) + active_drop * float(drop_bit)
+        ) / float(active_total)
+        achieved_avg_bits = float(drop_bit) + (used / max(total_params, 1e-12))
+        print(
+            "Active-only allocation: "
+            f"high={active_high}, low={active_low}, drop={active_drop}, total={active_total}, "
+            f"avg_bits={active_avg_bits:.4f}, achieved_avg_bits={achieved_avg_bits:.4f}, "
+            f"budget_use={used:.2f}/{extra_budget:.2f}"
+        )
 
     for key, st in states.items():
         alloc[key] = st["state"].clone()  # type: ignore[assignment]
