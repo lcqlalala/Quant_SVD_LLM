@@ -343,25 +343,46 @@ def report_mixed_precision_allocation(
     low_bit: float,
     drop_bit: float = 0.0,
     base_bits: float = None,
+    sigma_eps: float = 1e-12,
 ):
     total = 0
     high = 0
     low = 0
     drop = 0
+    active_total = 0
+    active_high = 0
+    active_low = 0
+    active_drop = 0
     for p in pairs:
         if p.key not in alloc:
             continue
         mask = alloc[p.key]
+        active = None
+        try:
+            u_norm = torch.linalg.vector_norm(p.u_module.weight.data.float(), dim=0)
+            v_norm = torch.linalg.vector_norm(p.v_module.weight.data.float(), dim=1)
+            active = (u_norm * v_norm) > float(sigma_eps)
+        except Exception:
+            active = None
         if isinstance(mask, torch.Tensor) and mask.dtype == torch.bool:
             total += int(mask.numel())
             high += int(mask.sum().item())
             low += int(mask.numel() - mask.sum().item())
+            if active is not None and active.numel() == mask.numel():
+                active_total += int(active.sum().item())
+                active_high += int((mask & active).sum().item())
+                active_low += int(((~mask) & active).sum().item())
         else:
             state = mask.to(dtype=torch.uint8)
             total += int(state.numel())
             high += int((state == MP_STATE_HIGH).sum().item())
             low += int((state == MP_STATE_LOW).sum().item())
             drop += int((state == MP_STATE_DROP).sum().item())
+            if active is not None and active.numel() == state.numel():
+                active_total += int(active.sum().item())
+                active_high += int(((state == MP_STATE_HIGH) & active).sum().item())
+                active_low += int(((state == MP_STATE_LOW) & active).sum().item())
+                active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
     avg_bits = 0.0
     if total > 0:
         high_bits = float(high_bit)
@@ -373,12 +394,28 @@ def report_mixed_precision_allocation(
         est_ratio = float(base_bits) / avg_bits
         msg += f", est_lowrank_compression_ratio={est_ratio:.4f}x"
     print(msg)
+    active_avg_bits = 0.0
+    if active_total > 0:
+        active_avg_bits = (
+            active_high * float(high_bit) + active_low * float(low_bit) + active_drop * float(drop_bit)
+        ) / float(active_total)
+        active_drop_ratio = float(active_drop) / float(active_total)
+        print(
+            "Mixed-precision active allocation: "
+            f"high={active_high}, low={active_low}, drop={active_drop}, total={active_total}, "
+            f"drop_ratio={active_drop_ratio:.4f}, avg_bits={active_avg_bits:.4f}"
+        )
     return {
         "high": high,
         "low": low,
         "drop": drop,
         "total": total,
         "avg_bits": avg_bits,
+        "active_high": active_high,
+        "active_low": active_low,
+        "active_drop": active_drop,
+        "active_total": active_total,
+        "active_avg_bits": active_avg_bits,
     }
 
 
@@ -852,6 +889,7 @@ if __name__ == '__main__':
             low_bit=args.mp_low_bit,
             drop_bit=args.mp_drop_bit,
             base_bits=base_weight_bits,
+            sigma_eps=args.mp_sigma_eps,
         )
         apply_two_path_quantization(
             model=model,

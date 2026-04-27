@@ -1120,27 +1120,30 @@ def solve_budgeted_multilevel_quadratic(
         if max_drop_ratio >= 1.0 or total_params <= 0.0:
             return
         eps_budget = 1e-9
+        forced_over_budget = False
         while True:
             _, _, active_drop, active_total = _active_allocation_counts()
             if active_total == 0:
                 return
             cur_ratio = float(active_drop) / float(active_total)
             if cur_ratio <= max_drop_ratio + 1e-12:
+                if forced_over_budget and used > extra_budget + eps_budget:
+                    print(
+                        "Warning: hard max_drop_ratio enforcement exceeded target budget; "
+                        f"budget_use={used:.2f}/{extra_budget:.2f}, "
+                        f"active_drop_ratio={cur_ratio:.4f}, max_drop_ratio={max_drop_ratio:.4f}"
+                    )
                 return
 
             remain_budget = extra_budget - used
-            if remain_budget <= eps_budget:
-                print(
-                    "Warning: max_drop_ratio could not be satisfied within target budget; "
-                    f"active_drop_ratio={cur_ratio:.4f}, max_drop_ratio={max_drop_ratio:.4f}, "
-                    f"budget_use={used:.2f}/{extra_budget:.2f}"
-                )
-                return
-
             best_key = None
             best_idx = -1
             best_density = -float("inf")
             best_cost = 0.0
+            best_over_key = None
+            best_over_idx = -1
+            best_over_density = -float("inf")
+            best_over_cost = 0.0
             for key, st in states.items():
                 active = st["active"]  # type: ignore[assignment]
                 state = st["state"]  # type: ignore[assignment]
@@ -1151,7 +1154,7 @@ def solve_budgeted_multilevel_quadratic(
                 cost_drop = float(st["cost_drop"])
                 cost_low = float(st["cost_low"])
                 cost_dl = cost_low - cost_drop
-                if cost_dl <= 0.0 or cost_dl > remain_budget + eps_budget:
+                if cost_dl <= 0.0:
                     continue
                 mask = active & (state == MP_STATE_DROP)
                 if not torch.any(mask):
@@ -1161,19 +1164,29 @@ def solve_budgeted_multilevel_quadratic(
                 max_gain, idx_t = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain.item())
                 density = gain_val / max(cost_dl, 1e-12)
-                if density > best_density:
+                if cost_dl <= remain_budget + eps_budget and density > best_density:
                     best_density = density
                     best_key = key
                     best_idx = int(idx_t.item())
                     best_cost = cost_dl
+                if density > best_over_density:
+                    best_over_density = density
+                    best_over_key = key
+                    best_over_idx = int(idx_t.item())
+                    best_over_cost = cost_dl
 
             if best_key is None or best_idx < 0:
-                print(
-                    "Warning: max_drop_ratio could not be satisfied because no feasible drop->low "
-                    f"upgrade remains; active_drop_ratio={cur_ratio:.4f}, "
-                    f"max_drop_ratio={max_drop_ratio:.4f}"
-                )
-                return
+                if best_over_key is None or best_over_idx < 0:
+                    print(
+                        "Warning: max_drop_ratio could not be satisfied because no drop->low "
+                        f"upgrade remains; active_drop_ratio={cur_ratio:.4f}, "
+                        f"max_drop_ratio={max_drop_ratio:.4f}"
+                    )
+                    return
+                best_key = best_over_key
+                best_idx = best_over_idx
+                best_cost = best_over_cost
+                forced_over_budget = True
 
             used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
             if best_cost <= 0.0:
@@ -1556,18 +1569,19 @@ def calibrate_component_sigma(
                     continue
                 if not bool(active[i].item()):
                     continue
-                root_sigma = math.sqrt(max(float(sigma_vec[i].item()), 0.0))
-                u = U_basis[:, i] * root_sigma
-                v = V_basis[i, :] * root_sigma
+                sigma_i = max(float(sigma_vec[i].item()), 0.0)
+                u = U_basis[:, i]
+                v = V_basis[i, :]
             else:
+                sigma_i = 1.0
                 u = U[:, i]
                 v = V[i, :]
             uq_l = _quantize_vec_symmetric(u, low_bit)
             vq_l = _quantize_vec_symmetric(v, low_bit)
             uq_h = _quantize_vec_symmetric(u, high_bit)
             vq_h = _quantize_vec_symmetric(v, high_bit)
-            low[i] = _rank1_outer_error(u, v, uq_l, vq_l)
-            high[i] = _rank1_outer_error(u, v, uq_h, vq_h)
+            low[i] = (sigma_i * sigma_i) * _rank1_outer_error(u, v, uq_l, vq_l)
+            high[i] = (sigma_i * sigma_i) * _rank1_outer_error(u, v, uq_h, vq_h)
         sigma[pair.key] = {"low": low, "high": high}
     return sigma
 
