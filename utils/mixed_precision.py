@@ -604,7 +604,10 @@ def compute_sigma_fisher_full(
             continue
         A_proj = stats[pair.key]["A_proj"].float().cpu()
         G_proj = stats[pair.key]["G_proj"].float().cpu()
+        A_proj = torch.nan_to_num(A_proj, nan=0.0, posinf=0.0, neginf=0.0)
+        G_proj = torch.nan_to_num(G_proj, nan=0.0, posinf=0.0, neginf=0.0)
         F_sigma = G_proj * A_proj
+        F_sigma = torch.nan_to_num(F_sigma, nan=0.0, posinf=0.0, neginf=0.0)
         F_sigma = 0.5 * (F_sigma + F_sigma.transpose(0, 1))
         if eps > 0:
             F_sigma = F_sigma + eps * torch.eye(F_sigma.shape[0], dtype=F_sigma.dtype)
@@ -933,6 +936,7 @@ def solve_budgeted_multilevel_quadratic(
             continue
         total_params += params_per_component * float(active_count)
 
+        F = torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
         F = 0.5 * (F + F.transpose(0, 1))
         # In theory Fisher diagonal should be non-negative; clamp for numerical robustness.
         diag = torch.diag(F).clamp_min(0.0)
@@ -943,8 +947,10 @@ def solve_budgeted_multilevel_quadratic(
         if sigma_calib is not None and pair.key in sigma_calib:
             # Calibrated sigma currently stores per-component approximation error.
             # Use it directly as variance proxy to avoid multiplying sigma^2 twice.
-            low_var = sigma_calib[pair.key]["low"].float().clamp_min(0.0).cpu()
-            high_var = sigma_calib[pair.key]["high"].float().clamp_min(0.0).cpu()
+            low_var = sigma_calib[pair.key]["low"].float().cpu()
+            high_var = sigma_calib[pair.key]["high"].float().cpu()
+            low_var = torch.nan_to_num(low_var, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+            high_var = torch.nan_to_num(high_var, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
         else:
             low_var = (sigma_vec * sigma_vec) * noise_low
             high_var = (sigma_vec * sigma_vec) * noise_high
@@ -1044,6 +1050,7 @@ def solve_budgeted_multilevel_quadratic(
             mask_dl = active & (state == MP_STATE_DROP)
             if torch.any(mask_dl):
                 gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
+                gain_dl = torch.nan_to_num(gain_dl, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
                 gain_dl = torch.where(mask_dl, gain_dl, inf_neg)
                 max_gain_dl, idx_dl = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain_dl.item())
@@ -1063,6 +1070,7 @@ def solve_budgeted_multilevel_quadratic(
             mask_dh = active & (state == MP_STATE_DROP)
             if torch.any(mask_dh):
                 gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var * diag)
+                gain_dh = torch.nan_to_num(gain_dh, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
                 gain_dh = torch.where(mask_dh, gain_dh, inf_neg)
                 max_gain_dh, idx_dh = torch.max(gain_dh, dim=0)
                 gain_val = float(max_gain_dh.item())
@@ -1081,6 +1089,7 @@ def solve_budgeted_multilevel_quadratic(
             mask_lh = active & (state == MP_STATE_LOW)
             if torch.any(mask_lh):
                 gain_lh = -(0.5 * (high_var - low_var) * diag)
+                gain_lh = torch.nan_to_num(gain_lh, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
                 gain_lh = torch.where(mask_lh, gain_lh, inf_neg)
                 max_gain_lh, idx_lh = torch.max(gain_lh, dim=0)
                 gain_val = float(max_gain_lh.item())
@@ -1154,13 +1163,16 @@ def solve_budgeted_multilevel_quadratic(
                 cost_drop = float(st["cost_drop"])
                 cost_low = float(st["cost_low"])
                 cost_dl = cost_low - cost_drop
-                if cost_dl <= 0.0:
+                if cost_dl < 0.0:
                     continue
                 mask = active & (state == MP_STATE_DROP)
                 if not torch.any(mask):
                     continue
                 gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
+                gain_dl = torch.nan_to_num(gain_dl, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
                 gain_dl = torch.where(mask, gain_dl, torch.tensor(-float("inf"), dtype=torch.float32))
+                if not torch.any(torch.isfinite(gain_dl) & mask):
+                    gain_dl = torch.where(mask, torch.zeros_like(gain_dl), gain_dl)
                 max_gain, idx_t = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain.item())
                 density = gain_val / max(cost_dl, 1e-12)
@@ -1189,7 +1201,7 @@ def solve_budgeted_multilevel_quadratic(
                 forced_over_budget = True
 
             used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
-            if best_cost <= 0.0:
+            if best_cost < 0.0:
                 return
 
     if min_keep_ratio > 0.0:

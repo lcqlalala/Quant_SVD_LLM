@@ -365,6 +365,8 @@ def report_mixed_precision_allocation(
         except Exception:
             active = None
         if isinstance(mask, torch.Tensor) and mask.dtype == torch.bool:
+            if active is not None:
+                active = active.to(device=mask.device)
             total += int(mask.numel())
             high += int(mask.sum().item())
             low += int(mask.numel() - mask.sum().item())
@@ -374,6 +376,8 @@ def report_mixed_precision_allocation(
                 active_low += int(((~mask) & active).sum().item())
         else:
             state = mask.to(dtype=torch.uint8)
+            if active is not None:
+                active = active.to(device=state.device)
             total += int(state.numel())
             high += int((state == MP_STATE_HIGH).sum().item())
             low += int((state == MP_STATE_LOW).sum().item())
