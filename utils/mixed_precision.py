@@ -414,7 +414,12 @@ def collect_kfac_stats_sigma_full(
     use_cache, prev_training, gc_enabled = _prepare_kfac_mode(model, use_grad_checkpointing)
     compute_dev = torch.device(device)
     proj_dev = torch.device(proj_device) if proj_device is not None else compute_dev
-    stats_dev = torch.device(accum_device) if accum_device is not None else compute_dev
+    if accum_device is None:
+        stats_dev = compute_dev
+    elif str(accum_device).lower() == "auto":
+        stats_dev = proj_dev
+    else:
+        stats_dev = torch.device(accum_device)
     param_grad_state = [(p, p.requires_grad) for p in model.parameters()]
     fn_t0 = time.perf_counter()
 

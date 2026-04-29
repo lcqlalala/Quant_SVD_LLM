@@ -502,8 +502,9 @@ if __name__ == '__main__':
         help='KFAC approximation used for component importance.'
     )
     parser.add_argument(
-        '--mp-kfac-accum-device', type=str, default='cuda', choices=['cuda', 'cpu'],
-        help='Device used to accumulate K-FAC statistics matrices. cpu uses less GPU memory but is slower.'
+        '--mp-kfac-accum-device', type=str, default='cuda',
+        help='Device used to accumulate K-FAC statistics matrices. Examples: cuda, cuda:1, cpu, auto. '
+             'Use cuda:1 with --mp-kfac-proj-device cuda:1 to offload K-FAC statistics to a second GPU.'
     )
     parser.add_argument(
         '--mp-kfac-proj-device', type=str, default=None,
