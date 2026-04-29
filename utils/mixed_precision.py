@@ -1015,6 +1015,25 @@ def solve_budgeted_multilevel_quadratic(
         st["state"][idx] = to_state  # type: ignore[index]
         return float(delta_cost)
 
+    def _apply_drop_to_low_many(st: Dict[str, object], idxs: torch.Tensor) -> float:
+        if idxs.numel() == 0:
+            return 0.0
+        state = st["state"]  # type: ignore[assignment]
+        idxs = idxs.to(dtype=torch.long)
+        idxs = idxs[state[idxs] == MP_STATE_DROP]
+        if idxs.numel() == 0:
+            return 0.0
+        sigma = st["sigma"]  # type: ignore[assignment]
+        low_var = st["low_var"]  # type: ignore[assignment]
+        delta_d = sigma[idxs]
+        st["d"][idxs] += delta_d  # type: ignore[index]
+        st["Fd"] += st["F"][:, idxs].matmul(delta_d)  # type: ignore[index]
+        st["var"][idxs] += low_var[idxs]  # type: ignore[index]
+        state[idxs] = MP_STATE_LOW
+        cost_drop = float(st["cost_drop"])
+        cost_low = float(st["cost_low"])
+        return float(cost_low - cost_drop) * float(idxs.numel())
+
     def _best_action_for_state(
         st: Dict[str, object], remain_budget: float, allow_nonpositive: bool = False
     ) -> Optional[Tuple[int, int, float, float, float]]:
@@ -1124,6 +1143,50 @@ def solve_budgeted_multilevel_quadratic(
             active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
         return active_high, active_low, active_drop, active_total
 
+    def _drop_to_low_gain(st: Dict[str, object], mask: torch.Tensor) -> torch.Tensor:
+        sigma = st["sigma"]  # type: ignore[assignment]
+        diag = st["diag"]  # type: ignore[assignment]
+        Fd = st["Fd"]  # type: ignore[assignment]
+        low_var = st["low_var"]  # type: ignore[assignment]
+        gain = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
+        gain = torch.nan_to_num(gain, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
+        gain = torch.where(mask, gain, torch.tensor(-float("inf"), dtype=torch.float32))
+        if not torch.any(torch.isfinite(gain) & mask):
+            gain = torch.where(mask, torch.zeros_like(gain), gain)
+        return gain
+
+    def _enforce_pairwise_max_drop_ratio() -> None:
+        nonlocal used
+        if max_drop_ratio >= 1.0 or total_params <= 0.0:
+            return
+        forced = False
+        for key, st in states.items():
+            active = st["active"]  # type: ignore[assignment]
+            state = st["state"]  # type: ignore[assignment]
+            active_total = int(active.sum().item())
+            if active_total == 0:
+                continue
+            max_drop_count = int(math.floor(float(active_total) * float(max_drop_ratio)))
+            drop_mask = active & (state == MP_STATE_DROP)
+            active_drop = int(drop_mask.sum().item())
+            need = active_drop - max_drop_count
+            if need <= 0:
+                continue
+            gain = _drop_to_low_gain(st, drop_mask)
+            chosen = torch.topk(gain, k=need, largest=True).indices
+            cost = _apply_drop_to_low_many(st, chosen)
+            used += cost
+            if used > extra_budget + 1e-9:
+                forced = True
+        if forced:
+            _, _, active_drop, active_total = _active_allocation_counts()
+            ratio = float(active_drop) / max(float(active_total), 1.0)
+            print(
+                "Warning: pairwise hard max_drop_ratio enforcement exceeded target budget; "
+                f"budget_use={used:.2f}/{extra_budget:.2f}, "
+                f"active_drop_ratio={ratio:.4f}, max_drop_ratio={max_drop_ratio:.4f}"
+            )
+
     def _enforce_max_drop_ratio() -> None:
         nonlocal used
         if max_drop_ratio >= 1.0 or total_params <= 0.0:
@@ -1168,11 +1231,7 @@ def solve_budgeted_multilevel_quadratic(
                 mask = active & (state == MP_STATE_DROP)
                 if not torch.any(mask):
                     continue
-                gain_dl = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * low_var * diag)
-                gain_dl = torch.nan_to_num(gain_dl, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
-                gain_dl = torch.where(mask, gain_dl, torch.tensor(-float("inf"), dtype=torch.float32))
-                if not torch.any(torch.isfinite(gain_dl) & mask):
-                    gain_dl = torch.where(mask, torch.zeros_like(gain_dl), gain_dl)
+                gain_dl = _drop_to_low_gain(st, mask)
                 max_gain, idx_t = torch.max(gain_dl, dim=0)
                 gain_val = float(max_gain.item())
                 density = gain_val / max(cost_dl, 1e-12)
@@ -1232,8 +1291,10 @@ def solve_budgeted_multilevel_quadratic(
             f"used_bits={used:.2f}, budget_bits={extra_budget:.2f}"
         )
 
-    # Satisfy the structural drop cap before gain-based upgrades spend budget
-    # on low->high transitions.
+    # Satisfy structural drop caps before gain-based upgrades spend budget on
+    # low->high transitions. Pairwise caps protect sensitive modules from local
+    # over-dropping; the global cap is retained as an aggregate sanity check.
+    _enforce_pairwise_max_drop_ratio()
     _enforce_max_drop_ratio()
 
     layer_best: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
@@ -1287,6 +1348,7 @@ def solve_budgeted_multilevel_quadratic(
 
     # Re-check after positive-gain upgrades. This should usually be a no-op,
     # but keeps the constraint explicit if future transitions are added.
+    _enforce_pairwise_max_drop_ratio()
     _enforce_max_drop_ratio()
 
     # Budget fill stage: if positive-gain greedy stops early, continue with
@@ -1354,12 +1416,26 @@ def solve_budgeted_multilevel_quadratic(
         active_avg_bits = (
             active_high * float(high_bit) + active_low * float(low_bit) + active_drop * float(drop_bit)
         ) / float(active_total)
+        max_pair_drop_ratio = 0.0
+        max_pair_drop_key = ""
+        for key, st in states.items():
+            active = st["active"]  # type: ignore[assignment]
+            state = st["state"]  # type: ignore[assignment]
+            pair_total = int(active.sum().item())
+            if pair_total <= 0:
+                continue
+            pair_drop = int(((state == MP_STATE_DROP) & active).sum().item())
+            pair_ratio = float(pair_drop) / float(pair_total)
+            if pair_ratio > max_pair_drop_ratio:
+                max_pair_drop_ratio = pair_ratio
+                max_pair_drop_key = key
         achieved_avg_bits = float(drop_bit) + (used / max(total_params, 1e-12))
         print(
             "Active-only allocation: "
             f"high={active_high}, low={active_low}, drop={active_drop}, total={active_total}, "
             f"avg_bits={active_avg_bits:.4f}, achieved_avg_bits={achieved_avg_bits:.4f}, "
-            f"budget_use={used:.2f}/{extra_budget:.2f}"
+            f"budget_use={used:.2f}/{extra_budget:.2f}, "
+            f"max_pair_drop_ratio={max_pair_drop_ratio:.4f}, max_pair_drop_key={max_pair_drop_key}"
         )
 
     for key, st in states.items():
