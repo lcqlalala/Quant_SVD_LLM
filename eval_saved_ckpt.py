@@ -6,6 +6,7 @@ import torch
 
 from evaluater import ppl_eval
 from utils.model_utils import get_model_from_local
+from utils.mixed_precision import set_mixed_precision_runtime_cache_policy
 
 
 def inspect_checkpoint(path: str) -> None:
@@ -51,6 +52,11 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--model_dtype", type=str, default="fp16", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--mp-persistent-runtime-cache",
+        action="store_true",
+        help="Keep MP dequantized/runtime weights cached during evaluation for faster inference.",
+    )
     parser.add_argument("--inspect_only", action="store_true", help="Only inspect checkpoint without evaluation")
     args = parser.parse_args()
 
@@ -86,6 +92,9 @@ def main():
         model = model.float()
     model = model.to(args.device)
     model.eval()
+    if args.mp_persistent_runtime_cache:
+        touched = set_mixed_precision_runtime_cache_policy(model, persistent=True)
+        print(f"Configured MP runtime cache policy on {touched} modules: persistent=True")
 
     ppl_eval(
         model,
