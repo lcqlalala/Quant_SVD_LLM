@@ -9,6 +9,70 @@ from utils.model_utils import get_model_from_local
 from utils.mixed_precision import set_mixed_precision_runtime_cache_policy
 
 
+def _mib(num_bytes: int) -> float:
+    return float(num_bytes) / (1024.0 * 1024.0)
+
+
+def _tensor_bytes(t: torch.Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+
+def _module_size_report(model: torch.nn.Module) -> dict:
+    param_count = 0
+    trainable_param_count = 0
+    param_bytes = 0
+    buffer_count = 0
+    buffer_bytes = 0
+    for p in model.parameters():
+        param_count += int(p.numel())
+        param_bytes += _tensor_bytes(p)
+        if p.requires_grad:
+            trainable_param_count += int(p.numel())
+    for b in model.buffers():
+        buffer_count += int(b.numel())
+        buffer_bytes += _tensor_bytes(b)
+    return {
+        "param_count": param_count,
+        "trainable_param_count": trainable_param_count,
+        "buffer_count": buffer_count,
+        "param_bytes": param_bytes,
+        "buffer_bytes": buffer_bytes,
+        "total_bytes": param_bytes + buffer_bytes,
+    }
+
+
+def _print_module_size_report(model: torch.nn.Module, prefix: str = "Model") -> None:
+    report = _module_size_report(model)
+    print(
+        f"{prefix} params: total={report['param_count']:,}, "
+        f"trainable={report['trainable_param_count']:,}, "
+        f"bytes={_mib(report['param_bytes']):.2f} MiB"
+    )
+    print(
+        f"{prefix} buffers: total={report['buffer_count']:,}, "
+        f"bytes={_mib(report['buffer_bytes']):.2f} MiB"
+    )
+    print(f"{prefix} params+buffers memory: {_mib(report['total_bytes']):.2f} MiB")
+
+
+def _print_cuda_memory(device: str, prefix: str) -> None:
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return
+    torch.cuda.synchronize(dev)
+    allocated = torch.cuda.memory_allocated(dev)
+    reserved = torch.cuda.memory_reserved(dev)
+    peak_allocated = torch.cuda.max_memory_allocated(dev)
+    peak_reserved = torch.cuda.max_memory_reserved(dev)
+    print(
+        f"{prefix} CUDA memory: "
+        f"allocated={_mib(allocated):.2f} MiB, "
+        f"reserved={_mib(reserved):.2f} MiB, "
+        f"peak_allocated={_mib(peak_allocated):.2f} MiB, "
+        f"peak_reserved={_mib(peak_reserved):.2f} MiB"
+    )
+
+
 def inspect_checkpoint(path: str) -> None:
     obj = torch.load(path, map_location="cpu", weights_only=False)
     print(f"checkpoint_path: {path}")
@@ -96,7 +160,12 @@ def main():
         touched = set_mixed_precision_runtime_cache_policy(model, persistent=True)
         print(f"Configured MP runtime cache policy on {touched} modules: persistent=True")
 
-    ppl_eval(
+    _print_module_size_report(model, prefix="Loaded model")
+    if torch.device(args.device).type == "cuda":
+        torch.cuda.reset_peak_memory_stats(torch.device(args.device))
+        _print_cuda_memory(args.device, "Before eval")
+
+    ppls, throughput = ppl_eval(
         model,
         tokenizer,
         datasets=[args.dataset],
@@ -104,6 +173,9 @@ def main():
         batch_size=args.eval_batch_size,
         device=args.device,
     )
+    print(f"Eval PPL summary: {ppls}")
+    print(f"Eval throughput summary (tokens/s): {throughput}")
+    _print_cuda_memory(args.device, "After eval")
 
 
 if __name__ == "__main__":

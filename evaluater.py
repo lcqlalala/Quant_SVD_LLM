@@ -89,6 +89,7 @@ def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_le
         print("CUDA Reserved Memory: {:.2f} MiB\n".format(reserved_mib))
     else:
         print("Weight Memory (params+buffers): {:.2f} MiB\n".format(weight_mib))
+    return ppls, throughput
 
 # only call this function when for 65b or more model    
 @torch.no_grad()
