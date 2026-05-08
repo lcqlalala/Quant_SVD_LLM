@@ -776,19 +776,22 @@ def solve_budgeted_topk_quadratic(
     sigma_eps: float = 1e-12,
 ) -> Dict[str, torch.Tensor]:
     """
-    Budgeted greedy selection with sigma-space quadratic objective:
-      L ~ 1/2 * z^T F_sigma z
-    where z is component perturbation scale.
+    Budgeted no-drop low/high allocation.
+
+    Quantization is modeled as zero-mean per-component noise. Under the
+    sigma-space Fisher approximation, independent quantization noise contributes
+    through the Fisher diagonal:
+      E[Delta L] ~= 1/2 * sum_i F_ii * Var(delta sigma_i).
     Start from all-low-bit baseline, then upgrade components to high-bit.
     """
     if high_bit <= low_bit:
         raise ValueError("high_bit must be larger than low_bit")
 
-    total_params = 0.0
-    states: Dict[str, Dict[str, object]] = {}
     alloc: Dict[str, torch.Tensor] = {}
-    noise_low = math.sqrt(_quant_noise_proxy(low_bit))
-    noise_high = math.sqrt(_quant_noise_proxy(high_bit))
+    noise_low = _quant_noise_proxy(low_bit)
+    noise_high = _quant_noise_proxy(high_bit)
+    items: List[Tuple[float, float, float, str, int]] = []
+    total_params = 0.0
 
     for pair in pairs:
         out_dim, rank = pair.u_module.weight.shape
@@ -803,84 +806,60 @@ def solve_budgeted_topk_quadratic(
             continue
 
         sigma_vec = _estimate_sigma_proxy(pair).float().cpu()
-        if sigma_calib is not None and pair.key in sigma_calib:
-            low_vec = sigma_calib[pair.key]["low"].float().clamp_min(0.0).sqrt().cpu()
-            high_vec = sigma_calib[pair.key]["high"].float().clamp_min(0.0).sqrt().cpu()
-        else:
-            low_vec = torch.full((rank,), noise_low, dtype=torch.float32)
-            high_vec = torch.full((rank,), noise_high, dtype=torch.float32)
-
         active = sigma_vec > sigma_eps
         active_count = int(active.sum().item())
         if active_count == 0:
             continue
-        total_params += params_per_component * float(active_count)
 
-        z = sigma_vec * low_vec
-        delta = sigma_vec * (high_vec - low_vec)  # negative when high<low
+        F = torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
         F = 0.5 * (F + F.transpose(0, 1))
-        Fz = F.matmul(z)
+        diag = torch.diag(F).clamp_min(0.0)
 
-        states[pair.key] = {
-            "F": F,
-            "Fz": Fz,
-            "delta": delta,
-            "mask": torch.zeros(rank, dtype=torch.bool),
-            "active": active,
-            "diag": torch.diag(F),
-            "cost": params_per_component * float(high_bit - low_bit),
-        }
+        if sigma_calib is not None and pair.key in sigma_calib:
+            # Calibrated sigma stores per-component reconstruction error after
+            # quantizing U/V with sigma kept in fp16. Treat it directly as a
+            # variance proxy; do not multiply by sigma again.
+            low_var = sigma_calib[pair.key]["low"].float().cpu()
+            high_var = sigma_calib[pair.key]["high"].float().cpu()
+            low_var = torch.nan_to_num(low_var, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+            high_var = torch.nan_to_num(high_var, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        else:
+            low_var = (sigma_vec * sigma_vec) * noise_low
+            high_var = (sigma_vec * sigma_vec) * noise_high
+        low_var = torch.where(active, low_var, torch.zeros_like(low_var))
+        high_var = torch.where(active, high_var, torch.zeros_like(high_var))
+
+        total_params += params_per_component * float(active_count)
+        delta_cost = params_per_component * float(high_bit - low_bit)
+        gain = 0.5 * diag * (low_var - high_var)
+        cand_idx = torch.where(active)[0]
+        for idx_t in cand_idx:
+            idx = int(idx_t.item())
+            value = float(gain[idx].item())
+            density = value / max(delta_cost, 1e-12)
+            items.append((density, value, delta_cost, pair.key, idx))
 
     target_avg = min(max(avg_bit, float(low_bit)), float(high_bit))
     extra_budget = total_params * (target_avg - float(low_bit))
     used = 0.0
+    items.sort(key=lambda x: x[0], reverse=True)
+    for _, _, delta_cost, key, idx in items:
+        if used + delta_cost > extra_budget + 1e-9:
+            continue
+        alloc[key][idx] = True
+        used += delta_cost
 
-    while True:
-        best_key = None
-        best_idx = -1
-        best_density = 0.0
-        best_gain = 0.0
-        best_cost = 0.0
-
-        for key, st in states.items():
-            cost = float(st["cost"])
-            if used + cost > extra_budget + 1e-9:
-                continue
-            mask = st["mask"]  # type: ignore[assignment]
-            active = st["active"]  # type: ignore[assignment]
-            Fz = st["Fz"]  # type: ignore[assignment]
-            delta = st["delta"]  # type: ignore[assignment]
-            diag = st["diag"]  # type: ignore[assignment]
-            remain = (~mask) & active
-            if not torch.any(remain):
-                continue
-            cand_idx = torch.where(remain)[0]
-            # gain = L(old)-L(new) for one-coordinate update z_i += delta_i
-            cand_delta = delta[cand_idx]
-            cand_gain = -(cand_delta * Fz[cand_idx] + 0.5 * (cand_delta * cand_delta) * diag[cand_idx])
-            max_gain, pos = torch.max(cand_gain, dim=0)
-            gain = float(max_gain.item())
-            if gain <= 0.0:
-                continue
-            density = gain / max(cost, 1e-12)
-            if density > best_density:
-                best_density = density
-                best_key = key
-                best_idx = int(cand_idx[int(pos.item())].item())
-                best_gain = gain
-                best_cost = cost
-
-        if best_key is None or best_idx < 0 or best_gain <= 0.0:
-            break
-
-        st = states[best_key]
-        delta_i = float(st["delta"][best_idx].item())  # type: ignore[index]
-        st["mask"][best_idx] = True  # type: ignore[index]
-        st["Fz"] += st["F"][:, best_idx] * delta_i  # type: ignore[index]
-        used += best_cost
-
-    for key, st in states.items():
-        alloc[key] = st["mask"].clone()  # type: ignore[assignment]
+    high_count = sum(int(mask.sum().item()) for mask in alloc.values())
+    total_count = sum(int(mask.numel()) for mask in alloc.values())
+    achieved_avg = float(low_bit)
+    if total_params > 0.0:
+        achieved_avg += used / total_params
+    print(
+        "No-drop low/high allocation: "
+        f"high={high_count}, low={total_count - high_count}, total={total_count}, "
+        f"target_avg_bits={target_avg:.4f}, achieved_avg_bits={achieved_avg:.4f}, "
+        f"budget_use={used:.2f}/{extra_budget:.2f}"
+    )
     return alloc
 
 
