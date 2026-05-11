@@ -94,10 +94,38 @@ def apply_rotary_pos_emb(
     position_ids: Optional[torch.LongTensor] = None,
     unsqueeze_dim: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if position_ids is None:
-        position_ids = torch.arange(q.shape[-2], device=q.device).unsqueeze(0)
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    def _format_rope_cache(cache: torch.Tensor) -> torch.Tensor:
+        # Target shape for q/k layout [batch, heads, seq, head_dim].
+        # Supported inputs:
+        #   [seq, head_dim]              old local rotary cache
+        #   [batch, seq, head_dim]       recent Transformers LLaMA cache
+        #   [batch, 1, seq, head_dim]    already broadcastable cache
+        #   [batch, seq, 1, head_dim]    occasionally produced by custom wrappers
+        bsz, _, q_len, _ = q.shape
+
+        if cache.dim() == 2:
+            if position_ids is None:
+                cache = cache[:q_len].unsqueeze(0)
+            else:
+                cache = cache[position_ids]
+            return cache.unsqueeze(unsqueeze_dim)
+
+        if cache.dim() == 3:
+            if cache.shape[0] == 1 and bsz != 1:
+                cache = cache.expand(bsz, -1, -1)
+            return cache.unsqueeze(unsqueeze_dim)
+
+        if cache.dim() == 4:
+            if cache.shape[1] == q_len and cache.shape[2] == 1:
+                cache = cache.transpose(1, 2)
+            if cache.shape[0] == 1 and bsz != 1:
+                cache = cache.expand(bsz, -1, -1, -1)
+            return cache
+
+        raise RuntimeError(f"Unsupported rotary cache shape: {tuple(cache.shape)}")
+
+    cos = _format_rope_cache(cos)
+    sin = _format_rope_cache(sin)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
