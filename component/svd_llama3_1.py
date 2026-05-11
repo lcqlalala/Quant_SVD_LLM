@@ -306,8 +306,13 @@ class SVD_Llama3Attention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         past_key_value = (key_states, value_states) if use_cache else None
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        num_key_value_groups = getattr(
+            self,
+            "num_key_value_groups",
+            getattr(self, "num_kv_groups", self.num_heads // self.num_key_value_heads),
+        )
+        key_states = repeat_kv(key_states, num_key_value_groups)
+        value_states = repeat_kv(value_states, num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
