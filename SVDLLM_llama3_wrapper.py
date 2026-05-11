@@ -16,6 +16,29 @@ import importlib
 import runpy
 import sys
 
+# Transformers 4.43.0 has an eager-default bug in LlamaRotaryEmbedding:
+#   config.rope_scaling.get("rope_type", config.rope_scaling["type"])
+# The default expression is evaluated before get(), so LLaMA-3.1 configs that
+# only contain "rope_type" can still raise KeyError("type").  Normalize the
+# config right after construction and before AutoModelForCausalLM builds layers.
+try:
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    _orig_llama_config_init = LlamaConfig.__init__
+
+    def _patched_llama_config_init(self, *args, **kwargs):
+        _orig_llama_config_init(self, *args, **kwargs)
+        rope_scaling = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            if "type" not in rope_scaling and "rope_type" in rope_scaling:
+                rope_scaling["type"] = rope_scaling["rope_type"]
+            if "rope_type" not in rope_scaling and "type" in rope_scaling:
+                rope_scaling["rope_type"] = rope_scaling["type"]
+
+    LlamaConfig.__init__ = _patched_llama_config_init
+except Exception as exc:
+    print(f"Warning: failed to install LLaMA-3.1 rope_scaling compatibility patch: {exc}")
+
 # 1) Import LLaMA-3/3.1 GQA-aware two-factor implementation.
 _fixed_component = importlib.import_module("component.svd_llama3_1")
 
