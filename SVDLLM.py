@@ -82,6 +82,43 @@ def _move_outer_rotary_emb(model, device):
         model.model.rotary_emb = model.model.rotary_emb.to(device)
 
 
+def _assert_llama3_svd_sanity(model):
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    num_heads = getattr(config, "num_attention_heads", None)
+    num_kv_heads = getattr(config, "num_key_value_heads", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    if num_heads is None or num_kv_heads is None or hidden_size is None:
+        return
+    if int(num_kv_heads) >= int(num_heads):
+        return
+
+    head_dim = getattr(config, "head_dim", int(hidden_size) // int(num_heads))
+    q_out = int(num_heads) * int(head_dim)
+    kv_out = int(num_kv_heads) * int(head_dim)
+    bad = []
+    for layer_idx, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        if hasattr(attn, "k_s_proj") or hasattr(attn, "v_s_proj") or hasattr(attn, "q_s_proj") or hasattr(attn, "o_s_proj"):
+            bad.append(f"layer {layer_idx}: found old *_s_proj attributes")
+        for name, expected in [("q_u_proj", q_out), ("k_u_proj", kv_out), ("v_u_proj", kv_out), ("o_u_proj", int(hidden_size))]:
+            mod = getattr(attn, name, None)
+            if isinstance(mod, nn.Linear) and int(mod.weight.shape[0]) != expected:
+                bad.append(f"layer {layer_idx}: {name}.out={int(mod.weight.shape[0])}, expected={expected}")
+        for name in ["q_mp_proj", "k_mp_proj", "v_mp_proj", "o_mp_proj"]:
+            if not hasattr(attn, name):
+                bad.append(f"layer {layer_idx}: missing {name}")
+    if bad:
+        preview = "\n".join(bad[:20])
+        raise RuntimeError(f"LLaMA-3/3.1 SVD sanity check failed:\n{preview}")
+    print(
+        "LLaMA-3/3.1 SVD sanity check passed: "
+        f"num_heads={num_heads}, num_key_value_heads={num_kv_heads}, "
+        f"head_dim={head_dim}, kv_out={kv_out}"
+    )
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -600,6 +637,7 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         whitening(args.model, model, profiling_mat, args.ratio, args.DEV, no_truncation=args.no_truncation)
+        _assert_llama3_svd_sanity(model)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -615,6 +653,7 @@ if __name__ == '__main__':
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, no_truncation=args.no_truncation)
+        _assert_llama3_svd_sanity(model)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -623,6 +662,7 @@ if __name__ == '__main__':
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, no_truncation=args.no_truncation)
+        _assert_llama3_svd_sanity(model)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:

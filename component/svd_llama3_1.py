@@ -338,15 +338,44 @@ class SVD_Llama3Attention(nn.Module):
         key_states = repeat_kv(key_states, num_key_value_groups)
         value_states = repeat_kv(value_states, num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-            min_val = torch.finfo(attn_weights.dtype).min
-            attn_weights = torch.max(attn_weights, torch.tensor(min_val, device=attn_weights.device))
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if output_attentions:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+                min_val = torch.finfo(attn_weights.dtype).min
+                attn_weights = torch.max(attn_weights, torch.tensor(min_val, device=attn_weights.device))
+            else:
+                past_len = key_states.shape[-2] - q_len
+                q_pos = torch.arange(q_len, device=attn_weights.device).unsqueeze(1) + past_len
+                k_pos = torch.arange(key_states.shape[-2], device=attn_weights.device).unsqueeze(0)
+                causal_mask = k_pos > q_pos
+                if causal_mask.any():
+                    attn_weights = attn_weights.masked_fill(
+                        causal_mask.unsqueeze(0).unsqueeze(0),
+                        torch.finfo(attn_weights.dtype).min,
+                    )
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+        else:
+            attn_weights = None
+            sdpa_mask = attention_mask
+            if sdpa_mask is not None and sdpa_mask.dtype != torch.bool:
+                sdpa_mask = sdpa_mask.to(dtype=query_states.dtype)
+            # Let SDPA handle causal masking internally when no external mask is
+            # supplied. This matches HF's optimized LLaMA attention behavior and
+            # avoids materializing a full causal mask in the common eval path.
+            is_causal = sdpa_mask is None and q_len > 1
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=sdpa_mask,
+                dropout_p=0.0,
+                is_causal=is_causal,
+            )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -360,6 +389,4 @@ class SVD_Llama3Attention(nn.Module):
         else:
             attn_output = self.o_mp_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
         return attn_output, attn_weights, past_key_value
