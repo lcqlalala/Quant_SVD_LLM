@@ -47,17 +47,51 @@ def _patch_llama_rope_scaling_compat() -> None:
     LlamaConfig._svdllm_rope_scaling_patched = True
 
 
-def get_model_from_huggingface(model_id):
-    from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaForCausalLM
+def patch_llama_rope_scaling_compat() -> None:
+    """Public wrapper for scripts that load HF LLaMA models directly."""
+    _patch_llama_rope_scaling_compat()
+
+
+def load_hf_model_and_tokenizer(
+    model_id,
+    torch_dtype=torch.float16,
+    device_map="cpu",
+    trust_remote_code=True,
+):
+    """
+    Unified HF loader for scripts that would otherwise call
+    AutoModelForCausalLM.from_pretrained(args.model) directly.
+
+    This keeps LLaMA-3/3.1 behavior consistent with get_model_from_huggingface:
+    - patch rope_scaling for transformers==4.43.0
+    - use AutoTokenizer for LLaMA-3/3.1
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
+
     _patch_llama_rope_scaling_compat()
     model_id_lower = str(model_id).lower()
     if "opt" in model_id_lower or "mistral" in model_id_lower or _is_llama3_model_id(model_id):
-        tokenizer = AutoTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=trust_remote_code)
     else:
-        tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.float16, trust_remote_code=True, cache_dir=None)
+        tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=trust_remote_code)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        cache_dir=None,
+    )
     model.seqlen = 2048
     return model, tokenizer
+
+
+def get_model_from_huggingface(model_id):
+    return load_hf_model_and_tokenizer(
+        model_id,
+        torch_dtype=torch.float16,
+        device_map="cpu",
+        trust_remote_code=True,
+    )
 
 def _resolve_tokenizer_source(model_path: str, tokenizer_path: Optional[str], model_obj) -> Optional[str]:
     if tokenizer_path and not tokenizer_path.endswith(".pt"):
