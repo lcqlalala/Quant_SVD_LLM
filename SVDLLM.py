@@ -62,6 +62,18 @@ def _assign_factorized_weights(u_proj: nn.Linear, v_proj: nn.Linear, svd_u: torc
             vw[:r, :in_cols] = svd_v[:r, :in_cols].to(vw.dtype)
 
 
+def _ensure_position_ids(batch, dev):
+    if "input_ids" not in batch:
+        return batch
+    input_ids = batch["input_ids"]
+    if "position_ids" in batch and batch["position_ids"] is not None:
+        batch["position_ids"] = batch["position_ids"].to(dev)
+        return batch
+    bsz, seqlen = input_ids.shape[:2]
+    batch["position_ids"] = torch.arange(seqlen, device=dev, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+    return batch
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -86,6 +98,8 @@ def profle_svdllm(name, model, calib_loader, dev):
             module.register_forward_hook(hook)
     for batch in tqdm(calib_loader):
         batch = {k: v.to(dev) for k, v in batch.items()}
+        if "opt" not in name:
+            batch = _ensure_position_ids(batch, dev)
         model(**batch)
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -145,19 +159,25 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
+            pos = kwargs.get('position_ids', None)
+            if pos is None and "opt" not in model_name:
+                bsz, seqlen = inp.shape[:2]
+                pos = torch.arange(seqlen, device=inp.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
             if cache['attention_mask'] is None:
                 cache['attention_mask'] = kwargs['attention_mask'].cpu()
                 if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
+                    cache['position_ids'] = pos.cpu()
             else:
                 cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
                 if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
+                    cache['position_ids'] = torch.cat((cache['position_ids'], pos.cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
         try:
             batch = {k: v.to(dev) for k, v in batch.items()}
+            if "opt" not in model_name:
+                batch = _ensure_position_ids(batch, dev)
             model(**batch)
         except ValueError:
             pass
@@ -345,19 +365,28 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
+            pos = kwargs.get('position_ids', None)
+            if pos is None and "opt" not in model_name:
+                bsz, seqlen = inp.shape[:2]
+                pos = torch.arange(seqlen, device=inp.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
             if cache['attention_mask'] is None:
                 cache['attention_mask'] = kwargs['attention_mask']
                 if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
+                    cache['position_ids'] = pos
             else:
                 cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
                 if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
+                    cache['position_ids'] = torch.cat((cache['position_ids'], pos), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            input_ids = batch[0].to(dev)
+            if "opt" not in model_name:
+                position_ids = torch.arange(input_ids.shape[1], device=dev, dtype=torch.long).unsqueeze(0).expand(input_ids.shape[0], -1)
+                model(input_ids=input_ids, position_ids=position_ids)
+            else:
+                model(input_ids)
         except ValueError:
             pass
     layers[0] = layers[0].module
