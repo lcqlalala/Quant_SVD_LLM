@@ -34,9 +34,27 @@ def _assign_factorized_weights(u_proj: nn.Linear, v_proj: nn.Linear, svd_u: torc
     with torch.no_grad():
         uw = u_proj.weight.data
         vw = v_proj.weight.data
+        if svd_u.shape[0] > uw.shape[0]:
+            raise ValueError(
+                "SVD U rows exceed target u_proj rows: "
+                f"svd_u={tuple(svd_u.shape)}, u_proj={tuple(uw.shape)}. "
+                "For GQA models such as LLaMA-3/3.1, K/V output rows must be "
+                "num_key_value_heads * head_dim, not hidden_size."
+            )
+        if svd_v.shape[1] > vw.shape[1]:
+            raise ValueError(
+                "SVD V cols exceed target v_proj cols: "
+                f"svd_v={tuple(svd_v.shape)}, v_proj={tuple(vw.shape)}."
+            )
         uw.zero_()
         vw.zero_()
         r = min(uw.shape[1], vw.shape[0], svd_u.shape[1], svd_v.shape[0])
+        if svd_u.shape[1] > uw.shape[1] or svd_v.shape[0] > vw.shape[0]:
+            raise ValueError(
+                "SVD rank exceeds target factor rank: "
+                f"svd_u={tuple(svd_u.shape)}, svd_v={tuple(svd_v.shape)}, "
+                f"u_proj={tuple(uw.shape)}, v_proj={tuple(vw.shape)}."
+            )
         out_rows = min(uw.shape[0], svd_u.shape[0])
         in_cols = min(vw.shape[1], svd_v.shape[1])
         if r > 0 and out_rows > 0 and in_cols > 0:

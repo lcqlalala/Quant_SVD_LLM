@@ -25,6 +25,11 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+try:
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
+except Exception:
+    HFLlamaRotaryEmbedding = None
+
 __all__ = [
     "SVD_Llama3Attention",
     "SVD_Llama3MLP",
@@ -189,6 +194,12 @@ class SVD_Llama3Attention(nn.Module):
     def __init__(self, config: LlamaConfig, *, ratio: float = 1.0):
         super().__init__()
         self.config = config
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            if "type" not in rope_scaling and "rope_type" in rope_scaling:
+                rope_scaling["type"] = rope_scaling["rope_type"]
+            if "rope_type" not in rope_scaling and "type" in rope_scaling:
+                rope_scaling["rope_type"] = rope_scaling["type"]
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
@@ -236,11 +247,21 @@ class SVD_Llama3Attention(nn.Module):
         self.v_mp_proj = None
         self.o_mp_proj = None
 
-        self.rotary_emb = LlamaRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
+        if HFLlamaRotaryEmbedding is not None:
+            try:
+                self.rotary_emb = HFLlamaRotaryEmbedding(config=self.config)
+            except TypeError:
+                self.rotary_emb = HFLlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=self.rope_theta,
+                )
+        else:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
 
     def _check_last_dim(self, name: str, tensor: torch.Tensor, expected: int):
         got = int(tensor.shape[-1])
@@ -295,7 +316,10 @@ class SVD_Llama3Attention(nn.Module):
             kv_seq_len += past_key_value[0].shape[-2]
 
         if position_embeddings is None:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            try:
+                cos, sin = self.rotary_emb(value_states, position_ids)
+            except TypeError:
+                cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         else:
             cos, sin = position_embeddings

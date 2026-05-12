@@ -12,9 +12,46 @@ sys.path.append(current_path)
 # bandaid fix
 dev = torch.device("cuda")
 
+
+def _is_llama3_model_id(model_id) -> bool:
+    text = str(model_id).lower()
+    return "llama-3" in text or "llama_3" in text or "llama3" in text or "llama-3.1" in text or "llama_3.1" in text
+
+
+def _patch_llama_rope_scaling_compat() -> None:
+    """
+    Transformers 4.43.0 can raise KeyError('type') for LLaMA-3.1 configs whose
+    rope_scaling has 'rope_type' but not 'type'. Patch LlamaConfig construction
+    in any entrypoint that loads HF LLaMA models, including eval scripts that do
+    not go through SVDLLM_llama3_wrapper.py.
+    """
+    try:
+        from transformers.models.llama.configuration_llama import LlamaConfig
+    except Exception:
+        return
+    if getattr(LlamaConfig, "_svdllm_rope_scaling_patched", False):
+        return
+
+    orig_init = LlamaConfig.__init__
+
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        rope_scaling = getattr(self, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            if "type" not in rope_scaling and "rope_type" in rope_scaling:
+                rope_scaling["type"] = rope_scaling["rope_type"]
+            if "rope_type" not in rope_scaling and "type" in rope_scaling:
+                rope_scaling["rope_type"] = rope_scaling["type"]
+
+    LlamaConfig.__init__ = patched_init
+    LlamaConfig._svdllm_rope_scaling_patched = True
+
+
 def get_model_from_huggingface(model_id):
     from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaForCausalLM
-    if "opt" in model_id or "mistral" in model_id:
+    _patch_llama_rope_scaling_compat()
+    model_id_lower = str(model_id).lower()
+    if "opt" in model_id_lower or "mistral" in model_id_lower or _is_llama3_model_id(model_id):
         tokenizer = AutoTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
     else:
         tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
@@ -358,6 +395,7 @@ def get_model_from_local(
     # HF local directory path
     if os.path.isdir(model_id):
         from transformers import AutoModelForCausalLM
+        _patch_llama_rope_scaling_compat()
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             device_map="cpu",
@@ -382,6 +420,7 @@ def get_model_from_local(
             model = obj["model"]
         elif obj.get("format", None) == "svd_mp_state_dict_v1" and isinstance(obj.get("state_dict", None), dict):
             from transformers import AutoModelForCausalLM
+            _patch_llama_rope_scaling_compat()
 
             state_dict = obj["state_dict"]
             if bool(obj.get("packed_lowbit_q", False)):
