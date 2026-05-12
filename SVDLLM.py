@@ -168,18 +168,21 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
+            attn_mask = kwargs.get('attention_mask', None)
             pos = kwargs.get('position_ids', None)
             if pos is None and "opt" not in model_name:
                 bsz, seqlen = inp.shape[:2]
                 pos = torch.arange(seqlen, device=inp.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                if "opt" not in model_name:
+            if "opt" not in model_name:
+                if cache['position_ids'] is None:
                     cache['position_ids'] = pos.cpu()
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
+                else:
                     cache['position_ids'] = torch.cat((cache['position_ids'], pos.cpu()), dim=0)
+            if attn_mask is not None:
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = attn_mask.cpu()
+                else:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], attn_mask.cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
@@ -225,7 +228,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
             if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
+                attn_mask_j = None if attention_masks is None else attention_masks[j].unsqueeze(0).to(dev)
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attn_mask_j, position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
             else:
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
         for h in handles:
@@ -376,18 +380,21 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
+            attn_mask = kwargs.get('attention_mask', None)
             pos = kwargs.get('position_ids', None)
             if pos is None and "opt" not in model_name:
                 bsz, seqlen = inp.shape[:2]
                 pos = torch.arange(seqlen, device=inp.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
+            if "opt" not in model_name:
+                if cache['position_ids'] is None:
                     cache['position_ids'] = pos
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
+                else:
                     cache['position_ids'] = torch.cat((cache['position_ids'], pos), dim=0)
+            if attn_mask is not None:
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = attn_mask
+                else:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], attn_mask), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
