@@ -74,6 +74,14 @@ def _ensure_position_ids(batch, dev):
     return batch
 
 
+def _move_outer_rotary_emb(model, device):
+    # Transformers >=4.43 LLaMA computes position_embeddings in LlamaModel
+    # before entering the first decoder layer. In low-resource profiling we only
+    # move embeddings and layer[0], so the outer rotary_emb must be moved too.
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
+        model.model.rotary_emb = model.model.rotary_emb.to(device)
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -145,6 +153,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+        _move_outer_rotary_emb(model, dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -190,6 +199,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     else:  
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+        _move_outer_rotary_emb(model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
@@ -350,6 +360,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+        _move_outer_rotary_emb(model, dev)
     model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
 
@@ -393,6 +404,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
+    _move_outer_rotary_emb(model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
