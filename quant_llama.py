@@ -67,6 +67,32 @@ def _resolve_llama_family(model_path: str, tokenizer_path: str, family_arg: str)
     return _infer_llama_family_from_paths(model_path, tokenizer_path)
 
 
+def _build_llama3_gqa_kv_protection(
+    pairs,
+    enabled: bool,
+    importance_boost: float,
+    min_keep_ratio: float,
+    max_drop_ratio: float,
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    importance_scale: Dict[str, float] = {}
+    min_keep: Dict[str, float] = {}
+    max_drop: Dict[str, float] = {}
+    if not enabled:
+        return importance_scale, min_keep, max_drop
+    for pair in pairs:
+        if pair.stem not in {"k", "v"}:
+            continue
+        if "self_attn" not in pair.parent_path:
+            continue
+        if importance_boost > 0.0 and importance_boost != 1.0:
+            importance_scale[pair.key] = float(importance_boost)
+        if min_keep_ratio >= 0.0:
+            min_keep[pair.key] = float(min_keep_ratio)
+        if max_drop_ratio >= 0.0:
+            max_drop[pair.key] = float(max_drop_ratio)
+    return importance_scale, min_keep, max_drop
+
+
 def _pack_int4_signed_rows(q: torch.Tensor) -> Tuple[torch.Tensor, int]:
     """
     Pack int8 tensor in [-8, 7] into uint8 (2 values per byte) along dim=1.
@@ -598,6 +624,25 @@ if __name__ == '__main__':
              'auto infers from model/tokenizer path; manually set when paths are ambiguous.'
     )
     parser.add_argument(
+        '--mp-disable-llama3-kv-protect', action='store_true',
+        help='Disable LLaMA-3/3.1 GQA K/V protection during MP allocation.'
+    )
+    parser.add_argument(
+        '--mp-llama3-kv-importance-boost', type=float, default=4.0,
+        help='Fisher importance multiplier for LLaMA-3/3.1 self_attn k/v pairs. '
+             'Default 4.0 matches the 32Q:8KV GQA sharing ratio.'
+    )
+    parser.add_argument(
+        '--mp-llama3-kv-min-keep-ratio', type=float, default=1.0,
+        help='Per-pair minimum keep ratio for LLaMA-3/3.1 self_attn k/v pairs. '
+             'Set <0 to disable this pair-specific bootstrap.'
+    )
+    parser.add_argument(
+        '--mp-llama3-kv-max-drop-ratio', type=float, default=0.0,
+        help='Per-pair maximum drop ratio for LLaMA-3/3.1 self_attn k/v pairs. '
+             'Set <0 to disable this pair-specific cap.'
+    )
+    parser.add_argument(
         '--mp-target-compression-ratio', type=float, default=0.0,
         help='If >0, auto-set mp_avg_bit from target low-rank compression ratio. '
              'Computed as mp_avg_bit = base_weight_bits / ratio, then clamped to [mp-low-bit, mp-high-bit].'
@@ -772,6 +817,24 @@ if __name__ == '__main__':
         if len(pairs) == 0:
             raise RuntimeError("No low-rank *_u_proj/*_v_proj pairs found. Please use an SVD-compressed model.")
         print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision. mode={args.mp_kfac_mode}")
+        llama3_kv_protect = (
+            resolved_family == "llama3" and not args.mp_disable_llama3_kv_protect
+        )
+        pair_importance_scale, pair_min_keep_ratio, pair_max_drop_ratio = _build_llama3_gqa_kv_protection(
+            pairs=pairs,
+            enabled=llama3_kv_protect,
+            importance_boost=args.mp_llama3_kv_importance_boost,
+            min_keep_ratio=args.mp_llama3_kv_min_keep_ratio,
+            max_drop_ratio=args.mp_llama3_kv_max_drop_ratio,
+        )
+        if llama3_kv_protect:
+            print(
+                "Enabled LLaMA-3 GQA K/V protection: "
+                f"pairs={len(pair_importance_scale or pair_min_keep_ratio or pair_max_drop_ratio)}, "
+                f"importance_boost={args.mp_llama3_kv_importance_boost:.4f}, "
+                f"min_keep_ratio={args.mp_llama3_kv_min_keep_ratio:.4f}, "
+                f"max_drop_ratio={args.mp_llama3_kv_max_drop_ratio:.4f}"
+            )
         finish_stage("discover_pairs")
 
         sigma_calib = None
@@ -873,6 +936,9 @@ if __name__ == '__main__':
                     min_keep_ratio=args.mp_min_keep_ratio,
                     max_drop_ratio=args.mp_max_drop_ratio,
                     prefer_low_from_drop=not args.mp_allow_drop_to_high,
+                    pair_importance_scale=pair_importance_scale,
+                    pair_min_keep_ratio=pair_min_keep_ratio,
+                    pair_max_drop_ratio=pair_max_drop_ratio,
                 )
             else:
                 alloc = solve_budgeted_topk_quadratic(
@@ -883,6 +949,7 @@ if __name__ == '__main__':
                     avg_bit=args.mp_avg_bit,
                     sigma_calib=sigma_calib,
                     sigma_eps=args.mp_sigma_eps,
+                    pair_importance_scale=pair_importance_scale,
                 )
         finish_stage("kfac_stats")
         finish_stage("allocation")
@@ -1020,6 +1087,10 @@ if __name__ == '__main__':
                     "max_drop_ratio": float(args.mp_max_drop_ratio),
                     "prefer_low_from_drop": bool(not args.mp_allow_drop_to_high),
                     "model_family": resolved_family,
+                    "llama3_kv_protect": bool(llama3_kv_protect),
+                    "llama3_kv_importance_boost": float(args.mp_llama3_kv_importance_boost),
+                    "llama3_kv_min_keep_ratio": float(args.mp_llama3_kv_min_keep_ratio),
+                    "llama3_kv_max_drop_ratio": float(args.mp_llama3_kv_max_drop_ratio),
                     "allocation_report": alloc_report,
                 },
                 "packed_lowbit_q": True,

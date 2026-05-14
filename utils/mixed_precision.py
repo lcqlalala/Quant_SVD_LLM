@@ -774,6 +774,7 @@ def solve_budgeted_topk_quadratic(
     avg_bit: float = 4.5,
     sigma_calib: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     sigma_eps: float = 1e-12,
+    pair_importance_scale: Optional[Dict[str, float]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Budgeted no-drop low/high allocation.
@@ -792,6 +793,7 @@ def solve_budgeted_topk_quadratic(
     noise_high = _quant_noise_proxy(high_bit)
     items: List[Tuple[float, float, float, str, int]] = []
     total_params = 0.0
+    pair_importance_scale = pair_importance_scale or {}
 
     for pair in pairs:
         out_dim, rank = pair.u_module.weight.shape
@@ -813,6 +815,9 @@ def solve_budgeted_topk_quadratic(
 
         F = torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
         F = 0.5 * (F + F.transpose(0, 1))
+        f_scale = float(pair_importance_scale.get(pair.key, 1.0))
+        if f_scale != 1.0:
+            F = F * f_scale
         diag = torch.diag(F).clamp_min(0.0)
 
         if sigma_calib is not None and pair.key in sigma_calib:
@@ -875,6 +880,9 @@ def solve_budgeted_multilevel_quadratic(
     min_keep_ratio: float = 0.0,
     max_drop_ratio: float = 1.0,
     prefer_low_from_drop: bool = True,
+    pair_importance_scale: Optional[Dict[str, float]] = None,
+    pair_min_keep_ratio: Optional[Dict[str, float]] = None,
+    pair_max_drop_ratio: Optional[Dict[str, float]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Unified drop/low/high allocation with sigma-space quadratic objective.
@@ -901,6 +909,9 @@ def solve_budgeted_multilevel_quadratic(
     used = 0.0
     noise_low = _quant_noise_proxy(low_bit)
     noise_high = _quant_noise_proxy(high_bit)
+    pair_importance_scale = pair_importance_scale or {}
+    pair_min_keep_ratio = pair_min_keep_ratio or {}
+    pair_max_drop_ratio = pair_max_drop_ratio or {}
 
     for pair in pairs:
         out_dim, rank = pair.u_module.weight.shape
@@ -922,6 +933,9 @@ def solve_budgeted_multilevel_quadratic(
 
         F = torch.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0)
         F = 0.5 * (F + F.transpose(0, 1))
+        f_scale = float(pair_importance_scale.get(pair.key, 1.0))
+        if f_scale != 1.0:
+            F = F * f_scale
         # In theory Fisher diagonal should be non-negative; clamp for numerical robustness.
         diag = torch.diag(F).clamp_min(0.0)
         d = torch.zeros(rank, dtype=torch.float32)
@@ -1141,16 +1155,19 @@ def solve_budgeted_multilevel_quadratic(
 
     def _enforce_pairwise_max_drop_ratio() -> None:
         nonlocal used
-        if max_drop_ratio >= 1.0 or total_params <= 0.0:
+        if total_params <= 0.0:
             return
         forced = False
         for key, st in states.items():
+            cap = float(pair_max_drop_ratio.get(key, max_drop_ratio))
+            if cap >= 1.0:
+                continue
             active = st["active"]  # type: ignore[assignment]
             state = st["state"]  # type: ignore[assignment]
             active_total = int(active.sum().item())
             if active_total == 0:
                 continue
-            max_drop_count = int(math.floor(float(active_total) * float(max_drop_ratio)))
+            max_drop_count = int(math.floor(float(active_total) * cap))
             drop_mask = active & (state == MP_STATE_DROP)
             active_drop = int(drop_mask.sum().item())
             need = active_drop - max_drop_count
@@ -1247,13 +1264,17 @@ def solve_budgeted_multilevel_quadratic(
             if best_cost < 0.0:
                 return
 
-    if min_keep_ratio > 0.0:
+    if min_keep_ratio > 0.0 or len(pair_min_keep_ratio) > 0:
         for key, st in states.items():
             active = st["active"]  # type: ignore[assignment]
             active_idx = torch.where(active)[0]
             if active_idx.numel() == 0:
                 continue
-            keep_count = int(math.ceil(float(active_idx.numel()) * min_keep_ratio))
+            keep_ratio = float(pair_min_keep_ratio.get(key, min_keep_ratio))
+            if keep_ratio <= 0.0:
+                continue
+            keep_ratio = min(max(keep_ratio, 0.0), 1.0)
+            keep_count = int(math.ceil(float(active_idx.numel()) * keep_ratio))
             if keep_count <= 0:
                 continue
             sigma_vec = st["sigma"]  # type: ignore[assignment]
