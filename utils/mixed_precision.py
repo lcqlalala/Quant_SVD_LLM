@@ -2501,11 +2501,14 @@ def apply_non_svd_fp16_cast(
     model: nn.Module,
     pairs: List[PairModules],
     exclude_lm_head: bool = False,
+    dtype: torch.dtype = torch.float16,
 ) -> Dict[str, int]:
     """
-    Cast non-SVD nn.Linear modules to fp16.
+    Cast non-SVD nn.Linear modules to fp16/bf16.
     Excludes all *_u_proj/*_v_proj pair modules tracked by `pairs`.
     """
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"Unsupported non-SVD floating dtype: {dtype}")
     excluded_ids = set()
     for pair in pairs:
         excluded_ids.add(id(pair.u_module))
@@ -2533,10 +2536,10 @@ def apply_non_svd_fp16_cast(
         if not mod.weight.is_floating_point():
             skipped += 1
             continue
-        if mod.weight.dtype != torch.float16:
-            mod.weight.data = mod.weight.data.to(dtype=torch.float16)
+        if mod.weight.dtype != dtype:
+            mod.weight.data = mod.weight.data.to(dtype=dtype)
             if mod.bias is not None and mod.bias.data.is_floating_point():
-                mod.bias.data = mod.bias.data.to(dtype=torch.float16)
+                mod.bias.data = mod.bias.data.to(dtype=dtype)
             converted += 1
 
     return {
@@ -2604,10 +2607,13 @@ def apply_non_svd_int8_quantization(
 def apply_embed_tokens_fp16(
     model: nn.Module,
     include_names: Optional[List[str]] = None,
+    dtype: torch.dtype = torch.float16,
 ) -> Dict[str, int]:
     """
-    Cast embedding modules named 'embed_tokens' (or custom names) to fp16.
+    Cast embedding modules named 'embed_tokens' (or custom names) to fp16/bf16.
     """
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"Unsupported embedding floating dtype: {dtype}")
     include = include_names if include_names is not None else ["embed_tokens"]
     converted = 0
     skipped = 0
@@ -2623,8 +2629,8 @@ def apply_embed_tokens_fp16(
         if not mod.weight.is_floating_point():
             skipped += 1
             continue
-        if mod.weight.dtype != torch.float16:
-            mod.weight.data = mod.weight.data.to(dtype=torch.float16)
+        if mod.weight.dtype != dtype:
+            mod.weight.data = mod.weight.data.to(dtype=dtype)
             converted += 1
     return {
         "total_embedding": total_embedding,

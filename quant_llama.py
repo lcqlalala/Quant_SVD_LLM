@@ -623,8 +623,8 @@ if __name__ == '__main__':
         help='[Deprecated] Quantize non-SVD nn.Linear modules to int8. Prefer --mp-nonsvd-precision int8.'
     )
     parser.add_argument(
-        '--mp-nonsvd-precision', type=str, default='fp16', choices=['fp16', 'int8'],
-        help='Non-SVD nn.Linear precision mode: fp16 or int8.'
+        '--mp-nonsvd-precision', type=str, default='fp16', choices=['fp16', 'bf16', 'int8'],
+        help='Non-SVD nn.Linear precision mode: fp16, bf16, or int8.'
     )
     parser.add_argument(
         '--mp-nonsvd-int8-exclude-lm-head', action='store_true',
@@ -635,8 +635,8 @@ if __name__ == '__main__':
         help='[Deprecated] Quantize embed_tokens to int8. Prefer --mp-embed-precision int8.'
     )
     parser.add_argument(
-        '--mp-embed-precision', type=str, default='fp16', choices=['fp16', 'int8'],
-        help='Embedding precision mode for embed_tokens: fp16 or int8.'
+        '--mp-embed-precision', type=str, default='fp16', choices=['fp16', 'bf16', 'int8'],
+        help='Embedding precision mode for embed_tokens: fp16, bf16, or int8.'
     )
     parser.add_argument(
         '--save-format', type=str, default='auto', choices=['auto', 'full', 'state_dict'],
@@ -924,13 +924,15 @@ if __name__ == '__main__':
                 f"exclude_lm_head={args.mp_nonsvd_int8_exclude_lm_head}"
             )
         else:
+            nonsvd_dtype = torch.bfloat16 if args.mp_nonsvd_precision == "bf16" else torch.float16
             nonsvd_report = apply_non_svd_fp16_cast(
                 model=model,
                 pairs=pairs,
                 exclude_lm_head=args.mp_nonsvd_int8_exclude_lm_head,
+                dtype=nonsvd_dtype,
             )
             print(
-                "Applied non-SVD fp16 cast: "
+                f"Applied non-SVD {args.mp_nonsvd_precision} cast: "
                 f"converted={nonsvd_report['converted']}, "
                 f"total_linear={nonsvd_report['total_linear']}, "
                 f"skipped={nonsvd_report['skipped']}, "
@@ -946,9 +948,10 @@ if __name__ == '__main__':
                 f"skipped={embed_report['skipped']}"
             )
         else:
-            embed_report = apply_embed_tokens_fp16(model=model)
+            embed_dtype = torch.bfloat16 if args.mp_embed_precision == "bf16" else torch.float16
+            embed_report = apply_embed_tokens_fp16(model=model, dtype=embed_dtype)
             print(
-                "Applied embed_tokens fp16 cast: "
+                f"Applied embed_tokens {args.mp_embed_precision} cast: "
                 f"converted={embed_report['converted']}, "
                 f"total_embedding={embed_report['total_embedding']}, "
                 f"skipped={embed_report['skipped']}"
