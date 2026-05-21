@@ -867,18 +867,9 @@ if __name__ == '__main__':
                 drop_bit=args.mp_drop_bit,
             )
             slack = max(float(args.mp_llama3_drop_slack_ratio), 0.0)
-            drop_cap = min(1.0, min_drop + slack)
-            keep_floor = max(0.0, 1.0 - drop_cap)
-            if args.mp_max_drop_ratio < 0:
-                args.mp_max_drop_ratio = drop_cap
-            else:
-                args.mp_max_drop_ratio = min(max(float(args.mp_max_drop_ratio), min_drop), drop_cap)
-            args.mp_min_keep_ratio = max(float(args.mp_min_keep_ratio), keep_floor)
             print(
                 "Enabled LLaMA-3 quant-first/drop-last allocation: "
                 f"min_required_drop={min_drop:.4f}, slack={slack:.4f}, "
-                f"max_drop_ratio={args.mp_max_drop_ratio:.4f}, "
-                f"min_keep_ratio={args.mp_min_keep_ratio:.4f}, "
                 f"avg_bit={args.mp_avg_bit:.4f}, low_bit={args.mp_low_bit}"
             )
         finish_stage("discover_pairs")
@@ -985,6 +976,8 @@ if __name__ == '__main__':
                     pair_importance_scale=pair_importance_scale,
                     pair_min_keep_ratio=pair_min_keep_ratio,
                     pair_max_drop_ratio=pair_max_drop_ratio,
+                    prioritize_low_coverage=llama3_quant_first,
+                    low_coverage_drop_slack_ratio=args.mp_llama3_drop_slack_ratio,
                 )
             else:
                 alloc = solve_budgeted_topk_quadratic(
