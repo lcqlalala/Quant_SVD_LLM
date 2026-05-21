@@ -93,17 +93,6 @@ def _build_llama3_gqa_kv_protection(
     return importance_scale, min_keep, max_drop
 
 
-def _llama3_min_required_drop_ratio(
-    avg_bit: float,
-    low_bit: int,
-    drop_bit: float,
-) -> float:
-    if float(low_bit) <= float(drop_bit):
-        return 0.0
-    need = (float(low_bit) - float(avg_bit)) / (float(low_bit) - float(drop_bit))
-    return min(max(need, 0.0), 1.0)
-
-
 def _pack_int4_signed_rows(q: torch.Tensor) -> Tuple[torch.Tensor, int]:
     """
     Pack int8 tensor in [-8, 7] into uint8 (2 values per byte) along dim=1.
@@ -654,13 +643,9 @@ if __name__ == '__main__':
              'Set <0 to disable this pair-specific cap.'
     )
     parser.add_argument(
-        '--mp-disable-llama3-quant-first', action='store_true',
-        help='Disable LLaMA-3/3.1 drop-last allocation safeguard. By default, LLaMA-3/3.1 '
-             'uses int4/int8 first and only drops the minimum components needed by the target budget.'
-    )
-    parser.add_argument(
-        '--mp-llama3-drop-slack-ratio', type=float, default=0.0,
-        help='Extra drop-ratio slack above the theoretical minimum for LLaMA-3/3.1 quant-first allocation.'
+        '--mp-llama3-min-high-ratio', type=float, default=0.02,
+        help='Minimum active component ratio assigned to high-bit/int8 for LLaMA-3/3.1. '
+             'Set 0 to disable. This balances drop against int8 instead of allowing all-low-bit allocation.'
     )
     parser.add_argument(
         '--mp-target-compression-ratio', type=float, default=0.0,
@@ -752,7 +737,7 @@ if __name__ == '__main__':
         if fam == "llama2":
             args.mp_max_drop_ratio = 0.30
         elif fam == "llama3":
-            args.mp_max_drop_ratio = 0.40
+            args.mp_max_drop_ratio = 0.10
         else:
             args.mp_max_drop_ratio = 0.50
         print(
@@ -855,22 +840,16 @@ if __name__ == '__main__':
                 f"min_keep_ratio={args.mp_llama3_kv_min_keep_ratio:.4f}, "
                 f"max_drop_ratio={args.mp_llama3_kv_max_drop_ratio:.4f}"
             )
-        llama3_quant_first = (
-            resolved_family == "llama3"
-            and args.mp_enable_drop
-            and not args.mp_disable_llama3_quant_first
+        llama3_min_high_ratio = (
+            max(float(args.mp_llama3_min_high_ratio), 0.0)
+            if resolved_family == "llama3" and args.mp_enable_drop
+            else 0.0
         )
-        if llama3_quant_first:
-            min_drop = _llama3_min_required_drop_ratio(
-                avg_bit=args.mp_avg_bit,
-                low_bit=args.mp_low_bit,
-                drop_bit=args.mp_drop_bit,
-            )
-            slack = max(float(args.mp_llama3_drop_slack_ratio), 0.0)
+        if llama3_min_high_ratio > 0.0:
             print(
-                "Enabled LLaMA-3 quant-first/drop-last allocation: "
-                f"min_required_drop={min_drop:.4f}, slack={slack:.4f}, "
-                f"avg_bit={args.mp_avg_bit:.4f}, low_bit={args.mp_low_bit}"
+                "Enabled LLaMA-3 int8/drop balance: "
+                f"min_high_ratio={llama3_min_high_ratio:.4f}, "
+                f"max_drop_ratio={args.mp_max_drop_ratio:.4f}"
             )
         finish_stage("discover_pairs")
 
@@ -976,8 +955,7 @@ if __name__ == '__main__':
                     pair_importance_scale=pair_importance_scale,
                     pair_min_keep_ratio=pair_min_keep_ratio,
                     pair_max_drop_ratio=pair_max_drop_ratio,
-                    prioritize_low_coverage=llama3_quant_first,
-                    low_coverage_drop_slack_ratio=args.mp_llama3_drop_slack_ratio,
+                    min_high_ratio=llama3_min_high_ratio,
                 )
             else:
                 alloc = solve_budgeted_topk_quadratic(
@@ -1130,8 +1108,7 @@ if __name__ == '__main__':
                     "llama3_kv_importance_boost": float(args.mp_llama3_kv_importance_boost),
                     "llama3_kv_min_keep_ratio": float(args.mp_llama3_kv_min_keep_ratio),
                     "llama3_kv_max_drop_ratio": float(args.mp_llama3_kv_max_drop_ratio),
-                    "llama3_quant_first": bool(llama3_quant_first),
-                    "llama3_drop_slack_ratio": float(args.mp_llama3_drop_slack_ratio),
+                    "llama3_min_high_ratio": float(llama3_min_high_ratio),
                     "allocation_report": alloc_report,
                 },
                 "packed_lowbit_q": True,

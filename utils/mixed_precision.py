@@ -883,8 +883,7 @@ def solve_budgeted_multilevel_quadratic(
     pair_importance_scale: Optional[Dict[str, float]] = None,
     pair_min_keep_ratio: Optional[Dict[str, float]] = None,
     pair_max_drop_ratio: Optional[Dict[str, float]] = None,
-    prioritize_low_coverage: bool = False,
-    low_coverage_drop_slack_ratio: float = 0.0,
+    min_high_ratio: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Unified drop/low/high allocation with sigma-space quadratic objective.
@@ -903,6 +902,8 @@ def solve_budgeted_multilevel_quadratic(
         raise ValueError("min_keep_ratio must be in [0, 1]")
     if not (0.0 <= max_drop_ratio <= 1.0):
         raise ValueError("max_drop_ratio must be in [0, 1]")
+    if not (0.0 <= min_high_ratio <= 1.0):
+        raise ValueError("min_high_ratio must be in [0, 1]")
 
     target_avg = min(max(avg_bit, float(drop_bit)), float(high_bit))
     states: Dict[str, Dict[str, object]] = {}
@@ -1035,10 +1036,7 @@ def solve_budgeted_multilevel_quadratic(
         return float(cost_low - cost_drop) * float(idxs.numel())
 
     def _best_action_for_state(
-        st: Dict[str, object],
-        remain_budget: float,
-        allow_nonpositive: bool = False,
-        drop_to_low_only: bool = False,
+        st: Dict[str, object], remain_budget: float, allow_nonpositive: bool = False
     ) -> Optional[Tuple[int, int, float, float, float]]:
         """
         Return best feasible action as:
@@ -1088,12 +1086,7 @@ def solve_budgeted_multilevel_quadratic(
         # Drop -> High. By default we route dropped components through low first,
         # which preserves more components under tight budgets.
         cost_dh = cost_high - cost_drop
-        if (
-            (not drop_to_low_only)
-            and (not prefer_low_from_drop)
-            and cost_dh > 0.0
-            and cost_dh <= remain_budget + eps_budget
-        ):
+        if (not prefer_low_from_drop) and cost_dh > 0.0 and cost_dh <= remain_budget + eps_budget:
             mask_dh = active & (state == MP_STATE_DROP)
             if torch.any(mask_dh):
                 gain_dh = -(sigma * Fd + 0.5 * (sigma * sigma) * diag + 0.5 * high_var * diag)
@@ -1112,7 +1105,7 @@ def solve_budgeted_multilevel_quadratic(
 
         # Low -> High
         cost_lh = cost_high - cost_low
-        if (not drop_to_low_only) and cost_lh > 0.0 and cost_lh <= remain_budget + eps_budget:
+        if cost_lh > 0.0 and cost_lh <= remain_budget + eps_budget:
             mask_lh = active & (state == MP_STATE_LOW)
             if torch.any(mask_lh):
                 gain_lh = -(0.5 * (high_var - low_var) * diag)
@@ -1150,6 +1143,66 @@ def solve_budgeted_multilevel_quadratic(
             active_low += int(((state == MP_STATE_LOW) & active).sum().item())
             active_drop += int(((state == MP_STATE_DROP) & active).sum().item())
         return active_high, active_low, active_drop, active_total
+
+    def _enforce_min_high_ratio() -> None:
+        nonlocal used
+        if min_high_ratio <= 0.0 or total_params <= 0.0:
+            return
+        eps_budget = 1e-9
+        active_high, _, _, active_total = _active_allocation_counts()
+        if active_total == 0:
+            return
+        target_high = int(math.ceil(float(active_total) * float(min_high_ratio)))
+        if active_high >= target_high:
+            return
+
+        while active_high < target_high:
+            remain_budget = extra_budget - used
+            if remain_budget <= eps_budget:
+                break
+            best_key = None
+            best_idx = -1
+            best_density = -float("inf")
+            best_cost = 0.0
+            for key, st in states.items():
+                active = st["active"]  # type: ignore[assignment]
+                state = st["state"]  # type: ignore[assignment]
+                low_var = st["low_var"]  # type: ignore[assignment]
+                high_var = st["high_var"]  # type: ignore[assignment]
+                diag = st["diag"]  # type: ignore[assignment]
+                cost_low = float(st["cost_low"])
+                cost_high = float(st["cost_high"])
+                cost_lh = cost_high - cost_low
+                if cost_lh <= 0.0 or cost_lh > remain_budget + eps_budget:
+                    continue
+                mask = active & (state == MP_STATE_LOW)
+                if not torch.any(mask):
+                    continue
+                gain_lh = -(0.5 * (high_var - low_var) * diag)
+                gain_lh = torch.nan_to_num(gain_lh, nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))
+                gain_lh = torch.where(mask, gain_lh, torch.tensor(-float("inf"), dtype=torch.float32))
+                max_gain, idx_t = torch.max(gain_lh, dim=0)
+                density = float(max_gain.item()) / max(cost_lh, 1e-12)
+                if density > best_density:
+                    best_density = density
+                    best_key = key
+                    best_idx = int(idx_t.item())
+                    best_cost = cost_lh
+
+            if best_key is None or best_idx < 0:
+                break
+            used += _apply_action(states[best_key], best_idx, MP_STATE_HIGH)
+            active_high += 1
+            if best_cost <= 0.0:
+                break
+
+        active_high, _, _, active_total = _active_allocation_counts()
+        if active_high < target_high:
+            print(
+                "Warning: min_high_ratio could not be fully satisfied within budget; "
+                f"active_high={active_high}, target_high={target_high}, "
+                f"min_high_ratio={min_high_ratio:.4f}, budget_use={used:.2f}/{extra_budget:.2f}"
+            )
 
     def _drop_to_low_gain(st: Dict[str, object], mask: torch.Tensor) -> torch.Tensor:
         sigma = st["sigma"]  # type: ignore[assignment]
@@ -1311,75 +1364,7 @@ def solve_budgeted_multilevel_quadratic(
     # over-dropping; the global cap is retained as an aggregate sanity check.
     _enforce_pairwise_max_drop_ratio()
     _enforce_max_drop_ratio()
-
-    if prioritize_low_coverage and total_params > 0.0 and used < extra_budget - 1e-6:
-        # LLaMA-3/3.1 GQA is sensitive to removing singular components.  Before
-        # spending any budget on low->high, restore as many dropped active
-        # components as the target budget allows. This is a soft drop-last rule:
-        # it never exceeds the budget, unlike hard min_keep bootstrapping.
-        coverage_budget = extra_budget
-        slack = min(max(float(low_coverage_drop_slack_ratio), 0.0), 1.0)
-        if slack > 0.0:
-            coverage_budget = max(
-                used,
-                extra_budget - total_params * slack * max(float(low_bit) - float(drop_bit), 0.0),
-            )
-        layer_best_cover: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
-        dirty_cover = set(states.keys())
-        max_steps = sum(int(st["active"].sum().item()) for st in states.values())  # type: ignore[index]
-        step = 0
-        while used < coverage_budget - 1e-6 and step < max_steps:
-            remain_budget = coverage_budget - used
-            if remain_budget <= 1e-9:
-                break
-            if dirty_cover:
-                for key in list(dirty_cover):
-                    layer_best_cover[key] = _best_action_for_state(
-                        states[key],
-                        remain_budget,
-                        allow_nonpositive=True,
-                        drop_to_low_only=True,
-                    )
-                dirty_cover.clear()
-
-            best_key = None
-            best_idx = -1
-            best_density = -float("inf")
-            best_cost = 0.0
-            for key, cand in layer_best_cover.items():
-                if cand is None:
-                    continue
-                idx, to_state, _gain, density, delta_cost = cand
-                if to_state != MP_STATE_LOW:
-                    continue
-                if delta_cost > remain_budget + 1e-9:
-                    dirty_cover.add(key)
-                    continue
-                if density > best_density:
-                    best_key = key
-                    best_idx = idx
-                    best_density = density
-                    best_cost = delta_cost
-
-            if best_key is None or best_idx < 0:
-                break
-            used += _apply_action(states[best_key], best_idx, MP_STATE_LOW)
-            if best_cost <= 0.0:
-                break
-            dirty_cover.add(best_key)
-            step += 1
-
-        high_c, low_c, drop_c, active_c = _active_allocation_counts()
-        achieved_avg_cover = float(drop_bit)
-        if total_params > 0.0:
-            achieved_avg_cover += used / total_params
-        print(
-            "LLaMA-3 quant-first coverage stage: "
-            f"high={high_c}, low={low_c}, drop={drop_c}, total={active_c}, "
-            f"achieved_avg_bits={achieved_avg_cover:.4f}, "
-            f"coverage_budget_use={used:.2f}/{coverage_budget:.2f}, "
-            f"target_budget={extra_budget:.2f}"
-        )
+    _enforce_min_high_ratio()
 
     layer_best: Dict[str, Optional[Tuple[int, int, float, float, float]]] = {}
     dirty_keys = set(states.keys())
